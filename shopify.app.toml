@@ -1,0 +1,31 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "b9ecc61bc453badc5b86ebeeb088c1e0"
+name = "shipwise-rate-pull"
+application_url = "https://example.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+# ⬅️ ADD THIS LINE UNDER [build] (replace with your dev store domain)
+# dev_store_url = "33d-dev.myshopify.com"
+
+[webhooks]
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_shipping,write_shipping"
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]

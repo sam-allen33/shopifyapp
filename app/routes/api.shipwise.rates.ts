@@ -29,7 +29,7 @@ function json(data: unknown, init?: number | ResponseInit): Response {
 // ---------------------------------------------------------------------------
 
 const SHIPWISE_API_URL =
-  process.env.SHIPWISE_API_URL ?? "https://your-vercel-deployment.vercel.app";
+  process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com/api/v1/Rate";
 const SHIPWISE_BEARER_TOKEN = process.env.SHIPWISE_BEARER_TOKEN;
 
 // Shopify Admin API credentials (needed to fetch product dimensions)

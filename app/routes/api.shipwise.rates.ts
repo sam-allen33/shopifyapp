@@ -442,7 +442,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     currency: shopCurrency,
   };
 
-  const shipwiseUrl = `const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/v1/Rate`;`;
+  const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/v1/Rate`;
 
   console.log("[Shipwise] Sending request to Shipwise API", {
     correlationId,

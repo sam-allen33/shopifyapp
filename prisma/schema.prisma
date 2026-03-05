@@ -31,3 +31,8 @@ model Session {
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
 }
+model ShipwiseConfig {
+  shop        String   @id
+  bearerToken String
+  updatedAt   DateTime @updatedAt
+}

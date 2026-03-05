@@ -456,7 +456,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   };
 
   // Shipwise endpoint (per your docs)
-  const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/v1/Rate`;
+  const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/shipping-rates`;
 
   console.log("[Shipwise] Sending request to Shipwise API", {
     correlationId,

@@ -30,7 +30,6 @@ function json(data: unknown, init?: number | ResponseInit): Response {
 
 const SHIPWISE_API_URL =
   process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com/api/v1/Rate";
-const SHIPWISE_BEARER_TOKEN = process.env.SHIPWISE_BEARER_TOKEN;
 
 // Shopify Admin API credentials (needed to fetch product dimensions)
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g., "your-store.myshopify.com"
@@ -310,6 +309,22 @@ function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) 
 // Main action – called by Shopify during checkout
 // ---------------------------------------------------------------------------
 
+const shopDomain =
+  request.headers.get("x-shopify-shop-domain") ||
+  request.headers.get("X-Shopify-Shop-Domain") ||
+  null;
+
+const config =
+  shopDomain
+    ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
+    : await prisma.shipwiseConfig.findFirst(); // fallback if header isn't present
+
+const SHIPWISE_BEARER_TOKEN = config?.bearerToken;
+
+if (!SHIPWISE_BEARER_TOKEN) {
+  console.error("[Shipwise] No token saved for this store", { correlationId, shopDomain });
+  return json({ rates: [] }, { status: 500 });
+}
 export const action = async ({ request }: ActionFunctionArgs) => {
   console.log(">>> Shipwise rates endpoint CALLED");
   const correlationId = createCorrelationId();

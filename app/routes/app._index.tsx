@@ -3,16 +3,13 @@ import { useLoaderData } from "react-router";
 
 import { authenticate } from "../shopify.server";
 
-// This is the text we send from the server down to the page
 type LoaderData = {
   message: string;
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  // This line logs in to the store as your app
   const { admin } = await authenticate.admin(request);
 
-  // This is a "special request" that asks Shopify to create a carrier
   const mutation = `#graphql
     mutation CarrierServiceCreate($input: DeliveryCarrierServiceCreateInput!) {
       carrierServiceCreate(input: $input) {
@@ -48,25 +45,28 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const response = await admin.graphql(mutation, { variables });
     const json = await response.json();
 
-    const userErrors =
-      json.data?.carrierServiceCreate?.userErrors ?? [];
+    const userErrors = json.data?.carrierServiceCreate?.userErrors ?? [];
 
     if (userErrors.length > 0) {
       console.log("CarrierServiceCreate userErrors", userErrors);
       message =
-        "Shipwise carrier is already set up or had minor issues. You can still continue to Shipping settings.";
+        "Shipwise carrier is already set up. Next step: turn it on in Shipping settings.";
     } else {
       message =
-        "Shipwise carrier is set up. Next step: turn it on in your store's Shipping settings.";
+        "Shipwise carrier is set up. Next step: turn it on in Shipping settings.";
     }
   } catch (error) {
+    // ✅ IMPORTANT: Shopify throws redirect Responses (302) that MUST be re-thrown
+    if (error instanceof Response) {
+      throw error;
+    }
+
     console.error("Error creating carrier service", error);
     message =
-      "There was an error talking to Shopify. Check the dev server window for details.";
+      "Could not talk to Shopify to create the carrier service. Check Render logs.";
   }
 
-  const data: LoaderData = { message };
-  return data;
+  return { message } satisfies LoaderData;
 };
 
 export default function IndexPage() {
@@ -77,9 +77,8 @@ export default function IndexPage() {
       <h1>Shipwise Shopify App</h1>
       <p>{data.message}</p>
       <p>
-        After this step, you'll go to your store's{" "}
-        <strong>Settings → Shipping and delivery</strong> page
-        to turn on the new Shipwise rates.
+        Go to <strong>Settings → Shipping and delivery</strong> to turn on the
+        Shipwise rates.
       </p>
     </div>
   );

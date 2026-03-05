@@ -1,4 +1,5 @@
 import type { ActionFunctionArgs } from "react-router";
+import prisma from "../db.server";
 
 // ---------------------------------------------------------------------------
 // Tiny local json() helper (since react-router doesn't export one here)
@@ -12,10 +13,6 @@ function json(data: unknown, init?: number | ResponseInit): Response {
       headers: { "Content-Type": "application/json" },
     });
   }
-  import type { ActionFunctionArgs } from "react-router";
-}
-import prisma from "../db.server";
-}
 
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) {
@@ -32,8 +29,7 @@ import prisma from "../db.server";
 // Environment configuration
 // ---------------------------------------------------------------------------
 
-const SHIPWISE_API_URL =
-  process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com";
+const SHIPWISE_API_URL = process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com";
 
 // Shopify Admin API credentials (needed to fetch product dimensions)
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g., "your-store.myshopify.com"
@@ -50,9 +46,9 @@ const SHIPWISE_RETURNS_CENTS = false;
 // You must set up these metafields in Shopify Admin > Settings > Custom data > Products
 const DIMENSION_METAFIELD_NAMESPACE = "shipping"; // or "custom" - match your store setup
 const DIMENSION_KEYS = {
-  length: "length",   // metafield key for length (in inches)
-  width: "width",     // metafield key for width (in inches)
-  height: "height",   // metafield key for height (in inches)
+  length: "length", // metafield key for length (in inches)
+  width: "width", // metafield key for width (in inches)
+  height: "height", // metafield key for height (in inches)
 };
 
 // Default dimensions if metafields are not set (fallback)
@@ -155,7 +151,6 @@ type ShipwiseResponse = {
   rates?: ShipwiseRate[] | null | any[];
 };
 
-
 type NormalizedShipwiseRate = {
   serviceName: string;
   serviceCode: string;
@@ -252,9 +247,12 @@ async function fetchProductDimensions(
       if (!node || !node.legacyResourceId) continue;
 
       const variantId = parseInt(node.legacyResourceId, 10);
-      const length = parseFloat(node.metafield_length?.value) || DEFAULT_DIMENSIONS.length;
-      const width = parseFloat(node.metafield_width?.value) || DEFAULT_DIMENSIONS.width;
-      const height = parseFloat(node.metafield_height?.value) || DEFAULT_DIMENSIONS.height;
+      const length =
+        parseFloat(node.metafield_length?.value) || DEFAULT_DIMENSIONS.length;
+      const width =
+        parseFloat(node.metafield_width?.value) || DEFAULT_DIMENSIONS.width;
+      const height =
+        parseFloat(node.metafield_height?.value) || DEFAULT_DIMENSIONS.height;
 
       dimensionsMap.set(variantId, { length, width, height });
     }
@@ -312,27 +310,34 @@ function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) 
 // ---------------------------------------------------------------------------
 // Main action – called by Shopify during checkout
 // ---------------------------------------------------------------------------
-
-
-}
 export const action = async ({ request }: ActionFunctionArgs) => {
   console.log(">>> Shipwise rates endpoint CALLED");
   const correlationId = createCorrelationId();
-    // Get the store domain Shopify is calling us for
+
+  if (request.method !== "POST") {
+    console.error("[Shipwise] Non-POST request hit /api/shipwise/rates", {
+      method: request.method,
+      correlationId,
+    });
+    return json({ error: "Method Not Allowed", correlationId }, { status: 405 });
+  }
+
+  // Figure out which shop is calling (Shopify usually sends this header)
   const shopDomain =
     request.headers.get("x-shopify-shop-domain") ||
     request.headers.get("X-Shopify-Shop-Domain") ||
     null;
 
-  // Look up the saved token for this store
+  // Fetch token from DB for that shop
   const config = shopDomain
     ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
     : null;
 
+  // Optional fallback to env var while you’re setting up
   const shipwiseBearerToken =
     config?.bearerToken || process.env.SHIPWISE_BEARER_TOKEN;
 
-  // If no token, don't break checkout — just return no rates
+  // If no token, do not break checkout — return no rates
   if (!shipwiseBearerToken) {
     console.error("[Shipwise] No token saved for this store", {
       correlationId,
@@ -340,18 +345,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
     return json({ rates: [] }, { status: 200 });
   }
-
-  if (request.method !== "POST") {
-    console.error("[Shipwise] Non-POST request hit /api/shipwise/rates", {
-      method: request.method,
-      correlationId,
-    });
-    return json(
-      { error: "Method Not Allowed", correlationId },
-      { status: 405 }
-    );
-  }
-
 
   // -------------------------------------------------------------------------
   // Parse Shopify request
@@ -398,7 +391,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     console.warn("[Shipwise] No items in Shopify rate request", {
       correlationId,
     });
-    return json({ rates: [] });
+    return json({ rates: [] }, { status: 200 });
   }
 
   const shopCurrency = rate.currency ?? "USD";
@@ -462,6 +455,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     currency: shopCurrency,
   };
 
+  // Shipwise endpoint (per your docs)
   const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/v1/Rate`;
 
   console.log("[Shipwise] Sending request to Shipwise API", {
@@ -561,7 +555,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ rates: [] }, { status: 502 });
   }
 
-// -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // Normalize and collect all rates
   // -------------------------------------------------------------------------
 
@@ -581,8 +575,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       allRates.push({
         serviceName:
           r.carrierService ?? r.class ?? r.carrier ?? r.carrierCode ?? "Shipping",
-        serviceCode:
-          r.carrierService ?? r.carrierCode ?? r.class ?? "standard",
+        serviceCode: r.carrierService ?? r.carrierCode ?? r.class ?? "standard",
         value: valueInDollars,
         currency: r.currencyCodeIso ?? shopCurrency,
         estimatedDeliveryDate:
@@ -602,8 +595,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     allRates.push({
       serviceName:
         r.carrierService ?? r.class ?? r.carrier ?? r.carrierCode ?? "Shipping",
-      serviceCode:
-        r.carrierService ?? r.carrierCode ?? r.class ?? "external",
+      serviceCode: r.carrierService ?? r.carrierCode ?? r.class ?? "external",
       value: valueInDollars,
       currency: r.currencyCodeIso ?? shopCurrency,
       estimatedDeliveryDate:
@@ -613,7 +605,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
-  
   // Process top-level `rates` array (newer Shipwise response shape)
   const topLevelRates = (shipwiseJson as any).rates;
   if (Array.isArray(topLevelRates)) {
@@ -694,12 +685,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-if (!allRates.length) {
+  if (!allRates.length) {
     console.warn("[Shipwise] No usable rates returned from Shipwise", {
       body: shipwiseJson,
       correlationId,
     });
-    return json({ rates: [] });
+    return json({ rates: [] }, { status: 200 });
   }
 
   // Log all rates received
@@ -717,9 +708,7 @@ if (!allRates.length) {
   // Find the LOWEST rate
   // -------------------------------------------------------------------------
 
-  const lowestRate = allRates.reduce((min, r) =>
-    r.value < min.value ? r : min
-  );
+  const lowestRate = allRates.reduce((min, r) => (r.value < min.value ? r : min));
 
   // Convert to Shopify format (price in CENTS as a STRING)
   const totalPriceCents = Math.round(lowestRate.value * 100);
@@ -748,5 +737,5 @@ if (!allRates.length) {
     allRatesCount: allRates.length,
   });
 
-  return json({ rates: [shopifyRate] });
+  return json({ rates: [shopifyRate] }, { status: 200 });
 };

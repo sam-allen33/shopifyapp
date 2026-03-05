@@ -42,6 +42,19 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 // Set to true if Shipwise returns rates in CENTS instead of dollars
 const SHIPWISE_RETURNS_CENTS = false;
 
+// Weight rounding mode for Shipwise requests.
+// Small deltas (like $0.15) are often caused by billable-weight thresholds.
+// Modes:
+// - "OZ"      : round UP to next whole ounce, then convert to pounds (common carrier behavior)
+// - "LB_0_1"  : round UP to next 0.1 lb
+// - "LB_0_01" : round UP to next 0.01 lb
+// - "CUSTOM"  : round UP to increments of SHIPWISE_WEIGHT_ROUNDING_INCREMENT_LB (in pounds)
+// - "NONE"    : no rounding (old behavior)
+const SHIPWISE_WEIGHT_ROUNDING = (process.env.SHIPWISE_WEIGHT_ROUNDING ?? "OZ").toUpperCase();
+const SHIPWISE_WEIGHT_ROUNDING_INCREMENT_LB = Number(
+  process.env.SHIPWISE_WEIGHT_ROUNDING_INCREMENT_LB ?? ""
+);
+
 // Metafield namespace and keys for product dimensions
 // You must set up these metafields in Shopify Admin > Settings > Custom data > Products
 const DIMENSION_METAFIELD_NAMESPACE = "shipping"; // or "custom" - match your store setup
@@ -61,6 +74,50 @@ const DEFAULT_DIMENSIONS = {
 // Simple helper to generate a correlation ID for logging
 function createCorrelationId() {
   return `shipwise-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Weight conversion + deterministic rounding for billable weight
+// ---------------------------------------------------------------------------
+function gramsToRoundedPounds(grams: number) {
+  if (!Number.isFinite(grams) || grams <= 0) return 0;
+
+  // More precise constant than 453.592 (helps avoid borderline float artifacts)
+  const poundsRaw = grams / 453.59237;
+
+  switch (SHIPWISE_WEIGHT_ROUNDING) {
+    case "NONE": {
+      return poundsRaw;
+    }
+
+    case "LB_0_1": {
+      // Round UP to next 0.1 lb
+      return Math.ceil(poundsRaw * 10) / 10;
+    }
+
+    case "LB_0_01": {
+      // Round UP to next 0.01 lb
+      return Math.ceil(poundsRaw * 100) / 100;
+    }
+
+    case "CUSTOM": {
+      // Round UP to next custom increment in pounds
+      const inc = SHIPWISE_WEIGHT_ROUNDING_INCREMENT_LB;
+      if (Number.isFinite(inc) && inc > 0) {
+        return Math.ceil(poundsRaw / inc) * inc;
+      }
+      // If CUSTOM is selected but increment is invalid, fall back safely
+      return poundsRaw;
+    }
+
+    case "OZ":
+    default: {
+      // Round UP to next whole ounce, then convert to pounds
+      // 1 oz = 28.349523125 g, 16 oz = 1 lb
+      const ounces = Math.ceil(grams / 28.349523125);
+      return ounces / 16;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +474,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const grams = item.grams ?? 0;
 
       // Convert grams to pounds (Shopify sends weight in grams)
-      const weightPerItemLb = grams > 0 ? grams / 453.592 : 0;
+      // IMPORTANT: use deterministic rounding to match carrier/Shipwise billable-weight rules
+      const weightPerItemLb = gramsToRoundedPounds(grams);
 
       // Get dimensions from metafields or use defaults
       const dimensions = item.variant_id

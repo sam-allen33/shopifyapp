@@ -12,6 +12,10 @@ function json(data: unknown, init?: number | ResponseInit): Response {
       headers: { "Content-Type": "application/json" },
     });
   }
+  import type { ActionFunctionArgs } from "react-router";
+}
+import prisma from "../db.server";
+}
 
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) {
@@ -29,7 +33,7 @@ function json(data: unknown, init?: number | ResponseInit): Response {
 // ---------------------------------------------------------------------------
 
 const SHIPWISE_API_URL =
-  process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com/api/v1/Rate";
+  process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com";
 
 // Shopify Admin API credentials (needed to fetch product dimensions)
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g., "your-store.myshopify.com"
@@ -309,25 +313,33 @@ function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) 
 // Main action – called by Shopify during checkout
 // ---------------------------------------------------------------------------
 
-const shopDomain =
-  request.headers.get("x-shopify-shop-domain") ||
-  request.headers.get("X-Shopify-Shop-Domain") ||
-  null;
 
-const config =
-  shopDomain
-    ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
-    : await prisma.shipwiseConfig.findFirst(); // fallback if header isn't present
-
-const SHIPWISE_BEARER_TOKEN = config?.bearerToken;
-
-if (!SHIPWISE_BEARER_TOKEN) {
-  console.error("[Shipwise] No token saved for this store", { correlationId, shopDomain });
-  return json({ rates: [] }, { status: 500 });
 }
 export const action = async ({ request }: ActionFunctionArgs) => {
   console.log(">>> Shipwise rates endpoint CALLED");
   const correlationId = createCorrelationId();
+    // Get the store domain Shopify is calling us for
+  const shopDomain =
+    request.headers.get("x-shopify-shop-domain") ||
+    request.headers.get("X-Shopify-Shop-Domain") ||
+    null;
+
+  // Look up the saved token for this store
+  const config = shopDomain
+    ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
+    : null;
+
+  const shipwiseBearerToken =
+    config?.bearerToken || process.env.SHIPWISE_BEARER_TOKEN;
+
+  // If no token, don't break checkout — just return no rates
+  if (!shipwiseBearerToken) {
+    console.error("[Shipwise] No token saved for this store", {
+      correlationId,
+      shopDomain,
+    });
+    return json({ rates: [] }, { status: 200 });
+  }
 
   if (request.method !== "POST") {
     console.error("[Shipwise] Non-POST request hit /api/shipwise/rates", {
@@ -340,13 +352,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
-  if (!SHIPWISE_BEARER_TOKEN) {
-    console.error(
-      "[Shipwise] Missing SHIPWISE_BEARER_TOKEN env variable",
-      { correlationId }
-    );
-    return json({ rates: [] }, { status: 500 });
-  }
 
   // -------------------------------------------------------------------------
   // Parse Shopify request
@@ -496,7 +501,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${SHIPWISE_BEARER_TOKEN}`,
+        Authorization: `Bearer ${shipwiseBearerToken}`,
         "X-Correlation-ID": correlationId,
       },
       body: JSON.stringify(shipwiseRequestBody),

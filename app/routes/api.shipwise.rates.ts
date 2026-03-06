@@ -32,8 +32,12 @@ function json(data: unknown, init?: number | ResponseInit): Response {
 const SHIPWISE_API_URL =
   process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com";
 
-// Shopify Admin API credentials (needed to fetch product dimensions)
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g., "your-store.myshopify.com"
+// Optional fallback store domain if the request header is missing.
+// Example: "your-store.myshopify.com"
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+
+// Required if you want the app to fetch the exact variant weight + unit
+// from Shopify Admin and stop relying on callback grams.
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
 // ---------------------------------------------------------------------------
@@ -65,14 +69,36 @@ function createCorrelationId() {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Exact weight conversion (grams -> pounds) with no upward rounding
+// Helper: Exact grams -> pounds fallback conversion
 // ---------------------------------------------------------------------------
 function gramsToPoundsExact(grams: number) {
   if (!Number.isFinite(grams) || grams <= 0) return 0;
 
-  // Exact grams -> pounds conversion.
-  // Keep a few decimals to avoid floating-point noise, but DO NOT round up.
+  // Exact conversion. Keep precision, do not round up.
   return Number((grams / 453.59237).toFixed(6));
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Convert Shopify's stored variant weight/unit into pounds
+// ---------------------------------------------------------------------------
+function shopifyWeightToPounds(
+  weight: number | null | undefined,
+  weightUnit: string | null | undefined
+): number | null {
+  if (weight == null || !Number.isFinite(weight) || weight <= 0) return null;
+
+  switch (weightUnit) {
+    case "POUNDS":
+      return Number(weight.toFixed(6));
+    case "OUNCES":
+      return Number((weight / 16).toFixed(6));
+    case "KILOGRAMS":
+      return Number((weight * 2.20462262185).toFixed(6));
+    case "GRAMS":
+      return Number((weight / 453.59237).toFixed(6));
+    default:
+      return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +147,11 @@ type ShopifyRateRequest = {
   };
 };
 
-type ProductDimensions = {
+type VariantShippingData = {
   length: number;
   width: number;
   height: number;
+  weightLb: number | null;
 };
 
 type ShipwiseRate = {
@@ -173,33 +200,41 @@ type NormalizedShipwiseRate = {
 };
 
 // ---------------------------------------------------------------------------
-// Helper: Fetch product dimensions from Shopify Admin API (via metafields)
+// Helper: Fetch variant dimensions + exact variant weight from Shopify Admin
 // ---------------------------------------------------------------------------
-async function fetchProductDimensions(
+async function fetchVariantShippingData(
   variantIds: number[],
-  correlationId: string
-): Promise<Map<number, ProductDimensions>> {
-  const dimensionsMap = new Map<number, ProductDimensions>();
+  correlationId: string,
+  requestedShopDomain: string | null
+): Promise<Map<number, VariantShippingData>> {
+  const shippingDataMap = new Map<number, VariantShippingData>();
 
-  // If no Shopify credentials, return empty map (will use defaults)
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+  const adminStoreDomain = requestedShopDomain || SHOPIFY_STORE_DOMAIN;
+
+  // If we cannot call Shopify Admin, we will fall back to callback grams later.
+  if (!adminStoreDomain || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
     console.warn(
-      "[Shipwise] Missing Shopify Admin API credentials - using default dimensions",
-      { correlationId }
+      "[Shipwise] Missing Shopify Admin API credentials - exact variant weight lookup disabled; falling back to callback grams",
+      {
+        correlationId,
+        adminStoreDomain,
+        hasAdminToken: !!SHOPIFY_ADMIN_ACCESS_TOKEN,
+      }
     );
-    return dimensionsMap;
+    return shippingDataMap;
   }
 
-  // Fetch dimensions for all variants in parallel
   const uniqueVariantIds = [...new Set(variantIds)];
+  if (!uniqueVariantIds.length) {
+    return shippingDataMap;
+  }
 
-  // Use GraphQL to batch fetch variant metafields
   const variantGids = uniqueVariantIds.map(
     (id) => `gid://shopify/ProductVariant/${id}`
   );
 
   const query = `
-    query GetVariantDimensions($ids: [ID!]!) {
+    query GetVariantShippingData($ids: [ID!]!) {
       nodes(ids: $ids) {
         ... on ProductVariant {
           id
@@ -222,7 +257,7 @@ async function fetchProductDimensions(
 
   try {
     const response = await fetch(
-      `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-10/graphql.json`,
+      `https://${adminStoreDomain}/admin/api/2024-10/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -237,28 +272,30 @@ async function fetchProductDimensions(
     );
 
     if (!response.ok) {
-      console.error("[Shipwise] Failed to fetch variant metafields", {
+      console.error("[Shipwise] Failed to fetch variant shipping data", {
         status: response.status,
         correlationId,
+        adminStoreDomain,
       });
-      return dimensionsMap;
+      return shippingDataMap;
     }
 
     const data = await response.json();
 
     if (data.errors) {
-      console.error("[Shipwise] GraphQL errors fetching dimensions", {
+      console.error("[Shipwise] GraphQL errors fetching variant shipping data", {
         errors: data.errors,
         correlationId,
+        adminStoreDomain,
       });
-      return dimensionsMap;
+      return shippingDataMap;
     }
 
-    // Parse the response and build the dimensions map
     for (const node of data.data?.nodes ?? []) {
       if (!node || !node.legacyResourceId) continue;
 
       const variantId = parseInt(node.legacyResourceId, 10);
+
       const length =
         parseFloat(node.metafield_length?.value) || DEFAULT_DIMENSIONS.length;
       const width =
@@ -266,22 +303,31 @@ async function fetchProductDimensions(
       const height =
         parseFloat(node.metafield_height?.value) || DEFAULT_DIMENSIONS.height;
 
-      dimensionsMap.set(variantId, { length, width, height });
+      const weightLb = shopifyWeightToPounds(node.weight, node.weightUnit);
+
+      shippingDataMap.set(variantId, {
+        length,
+        width,
+        height,
+        weightLb,
+      });
     }
 
-    console.log("[Shipwise] Fetched dimensions for variants", {
+    console.log("[Shipwise] Fetched variant shipping data", {
       correlationId,
-      variantCount: dimensionsMap.size,
-      variants: Object.fromEntries(dimensionsMap),
+      adminStoreDomain,
+      variantCount: shippingDataMap.size,
+      variants: Object.fromEntries(shippingDataMap),
     });
   } catch (err) {
-    console.error("[Shipwise] Error fetching product dimensions", {
+    console.error("[Shipwise] Error fetching variant shipping data", {
       err,
       correlationId,
+      adminStoreDomain,
     });
   }
 
-  return dimensionsMap;
+  return shippingDataMap;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,18 +380,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Method Not Allowed", correlationId }, { status: 405 });
   }
 
-  // Figure out which shop is calling (Shopify usually sends this header)
+  // Shopify usually sends this header on the carrier callback
   const shopDomain =
     request.headers.get("x-shopify-shop-domain") ||
     request.headers.get("X-Shopify-Shop-Domain") ||
     null;
 
-  // Fetch token from DB for that shop
+  // Fetch Shipwise token from DB for that shop
   const config = shopDomain
     ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
     : null;
 
-  // Optional fallback to env var while you’re setting up
+  // Optional fallback to env var while setting up
   const shipwiseBearerToken =
     config?.bearerToken || process.env.SHIPWISE_BEARER_TOKEN;
 
@@ -382,9 +428,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ rates: [] }, { status: 400 });
   }
 
-  // Log what Shopify sent us (for debugging)
   console.log("[Shipwise] Received Shopify rate request", {
     correlationId,
+    shopDomain,
     hasOrigin: !!rate.origin,
     originCountry: rate.origin?.country_code || rate.origin?.country,
     originPostal: rate.origin?.postal_code || rate.origin?.zip,
@@ -409,57 +455,78 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shopCurrency = rate.currency ?? "USD";
 
   // -------------------------------------------------------------------------
-  // Fetch product dimensions from Shopify metafields
+  // Fetch exact variant shipping data from Shopify Admin
   // -------------------------------------------------------------------------
 
-  const variantIds = items
-    .filter((i) => i.requires_shipping !== false && i.variant_id)
+  const shippableItems = items.filter((i) => i.requires_shipping !== false);
+
+  const variantIds = shippableItems
+    .filter((i) => i.variant_id)
     .map((i) => i.variant_id!);
 
-  const dimensionsMap = await fetchProductDimensions(variantIds, correlationId);
+  const shippingDataMap = await fetchVariantShippingData(
+    variantIds,
+    correlationId,
+    shopDomain
+  );
 
   // -------------------------------------------------------------------------
-  // Build Shipwise request body with REAL data from Shopify
+  // Build Shipwise request body
   // -------------------------------------------------------------------------
 
-  const shipwiseItems = items
-    .filter((i) => i.requires_shipping !== false)
-    .map((item, index) => {
-      const quantity = item.quantity ?? 1;
-      const grams = item.grams ?? 0;
+  const shipwiseItems = shippableItems.map((item, index) => {
+    const quantity = item.quantity ?? 1;
+    const grams = item.grams ?? 0;
 
-      // Convert Shopify grams to exact pounds with no upward rounding
-      const weightPerItemLb = gramsToPoundsExact(grams);
+    const shippingData = item.variant_id
+      ? shippingDataMap.get(item.variant_id)
+      : undefined;
 
-      // Get dimensions from metafields or use defaults
-      const dimensions = item.variant_id
-        ? dimensionsMap.get(item.variant_id) ?? DEFAULT_DIMENSIONS
-        : DEFAULT_DIMENSIONS;
+    const hasVariantWeight =
+      typeof shippingData?.weightLb === "number" &&
+      Number.isFinite(shippingData.weightLb) &&
+      shippingData.weightLb > 0;
 
-      return {
-        id: index + 1,
-        sku: item.sku ?? item.name ?? `item-${index + 1}`,
-        description: item.name ?? item.sku ?? "Item",
-        quantity,
-        // Weight from Shopify (converted to pounds exactly)
-        weight: weightPerItemLb,
-        // Dimensions from Shopify metafields
-        length: dimensions.length,
-        width: dimensions.width,
-        height: dimensions.height,
-        // Price from Shopify (converted from cents to dollars)
-        price: (item.price ?? 0) / 100,
-        // Include IDs for traceability
-        productId: item.product_id,
-        variantId: item.variant_id,
-      };
-    });
+    const weightPerItemLb = hasVariantWeight
+      ? shippingData!.weightLb!
+      : gramsToPoundsExact(grams);
 
-  // Convert addresses (BOTH origin and destination from Shopify)
+    if (!hasVariantWeight) {
+      console.warn(
+        "[Shipwise] Using callback grams fallback instead of exact Shopify variant weight",
+        {
+          correlationId,
+          variantId: item.variant_id,
+          sku: item.sku ?? item.name ?? `item-${index + 1}`,
+          grams,
+          fallbackWeightLb: weightPerItemLb,
+        }
+      );
+    }
+
+    const length = shippingData?.length ?? DEFAULT_DIMENSIONS.length;
+    const width = shippingData?.width ?? DEFAULT_DIMENSIONS.width;
+    const height = shippingData?.height ?? DEFAULT_DIMENSIONS.height;
+
+    return {
+      id: index + 1,
+      sku: item.sku ?? item.name ?? `item-${index + 1}`,
+      description: item.name ?? item.sku ?? "Item",
+      quantity,
+      // Weight in pounds - exact Shopify variant weight first, grams fallback second
+      weight: weightPerItemLb,
+      length,
+      width,
+      height,
+      price: (item.price ?? 0) / 100,
+      productId: item.product_id,
+      variantId: item.variant_id,
+    };
+  });
+
   const shipwiseOrigin = convertAddress(origin, "Origin");
   const shipwiseDestination = convertAddress(destination, "Destination");
 
-  // Build the complete request body
   const shipwiseRequestBody = {
     items: shipwiseItems,
     origin: shipwiseOrigin,
@@ -467,7 +534,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     currency: shopCurrency,
   };
 
-  // Shipwise endpoint (per your docs)
   const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/shipping-rates`;
 
   console.log("[Shipwise] Sending request to Shipwise API", {
@@ -486,12 +552,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       country: shipwiseDestination.countryCode,
     },
     itemCount: shipwiseItems.length,
-    items: shipwiseItems.map((i) => ({
-      sku: i.sku,
-      qty: i.quantity,
-      weight: i.weight.toFixed(6),
-      dims: `${i.length}x${i.width}x${i.height}`,
-    })),
+    items: shipwiseItems.map((i, idx) => {
+      const originalItem = shippableItems[idx];
+      const shippingData = originalItem?.variant_id
+        ? shippingDataMap.get(originalItem.variant_id)
+        : undefined;
+
+      const hasVariantWeight =
+        typeof shippingData?.weightLb === "number" &&
+        Number.isFinite(shippingData.weightLb) &&
+        shippingData.weightLb > 0;
+
+      return {
+        sku: i.sku,
+        qty: i.quantity,
+        weight: i.weight.toFixed(6),
+        weightSource: hasVariantWeight
+          ? "variantWeight"
+          : "callbackGramsFallback",
+        dims: `${i.length}x${i.width}x${i.height}`,
+      };
+    }),
   });
 
   // -------------------------------------------------------------------------
@@ -548,8 +629,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       (shipwiseJson as any).rates && Array.isArray((shipwiseJson as any).rates)
         ? (shipwiseJson as any).rates.length
         : (shipwiseJson as any).rates
-        ? 1
-        : 0,
+          ? 1
+          : 0,
     rateErrors: shipwiseJson.rateErrors,
   });
 
@@ -558,7 +639,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     body: shipwiseJson,
   });
 
-  if (!shipwiseRes.ok || shipwiseJson.wasSuccessful === false) {
+  if (
+    !shipwiseRes.ok ||
+    shipwiseJson.wasSuccessful === false ||
+    shipwiseJson.success === false
+  ) {
     console.error("[Shipwise] Shipwise API responded with error", {
       status: shipwiseRes.status,
       body: shipwiseJson,
@@ -573,7 +658,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const allRates: NormalizedShipwiseRate[] = [];
 
-  // Process shipmentItems rates
   for (const item of shipwiseJson.shipmentItems ?? []) {
     const candidateRates: ShipwiseRate[] = [];
     if (item.selectedRate) candidateRates.push(item.selectedRate);
@@ -598,7 +682,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  // Process externalServices rates
   for (const r of shipwiseJson.externalServices ?? []) {
     if (!r || r.value == null || r.value <= 0) continue;
 
@@ -617,7 +700,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
-  // Process top-level `rates` array (newer Shipwise response shape)
   const topLevelRates = (shipwiseJson as any).rates;
   if (Array.isArray(topLevelRates)) {
     console.log("[Shipwise] Processing top-level Shipwise rates", {
@@ -705,7 +787,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ rates: [] }, { status: 200 });
   }
 
-  // Log all rates received
   console.log("[Shipwise] All rates from Shipwise", {
     correlationId,
     rates: allRates.map((r) => ({
@@ -722,7 +803,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const lowestRate = allRates.reduce((min, r) => (r.value < min.value ? r : min));
 
-  // Convert to Shopify format (price in CENTS as a STRING)
   const totalPriceCents = Math.round(lowestRate.value * 100);
 
   const shopifyRate = {

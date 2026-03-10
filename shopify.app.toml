@@ -2,8 +2,8 @@
 
 client_id = "b9ecc61bc453badc5b86ebeeb088c1e0"
 name = "shipwise-rate-pull"
-application_url = "https://shopifyapp-e92y.onrender.com"
-redirect_urls = [ "https://shopifyapp-e92y.onrender.com/auth/callback" ]
+application_url = "https://live-rate-shop.onrender.com"
+redirect_urls = [ "https://live-rate-shop.onrender.com/auth/callback" ]
 embedded = true
 
 [build]

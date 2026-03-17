@@ -11,7 +11,6 @@ function json(data: unknown, init?: number | ResponseInit): Response {
     return new Response(body, {
       status: init,
       headers: { "Content-Type": "application/json" },
-    });
   }
 
   const headers = new Headers(init?.headers);
@@ -22,7 +21,6 @@ function json(data: unknown, init?: number | ResponseInit): Response {
   return new Response(body, {
     ...init,
     headers,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -31,14 +29,6 @@ function json(data: unknown, init?: number | ResponseInit): Response {
 
 const SHIPWISE_API_URL =
   process.env.SHIPWISE_API_URL ?? "https://api.shipwise.com";
-
-// Optional fallback store domain if the request header is missing.
-// Example: "your-store.myshopify.com"
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-
-// Required if you want the app to fetch the exact variant weight + unit
-// from Shopify Admin and stop relying on callback grams.
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -66,6 +56,23 @@ const DEFAULT_DIMENSIONS = {
 // Simple helper to generate a correlation ID for logging
 function createCorrelationId() {
   return `shipwise-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function getOfflineShopAdminAccessToken(
+  shopDomain: string | null
+): Promise<string | null> {
+  if (!shopDomain) return null;
+
+  const offlineSession = await prisma.session.findFirst({
+    where: {
+      shop: shopDomain,
+      isOnline: false,
+    },
+    select: {
+      accessToken: true,
+    },
+
+  return offlineSession?.accessToken ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,20 +212,21 @@ type NormalizedShipwiseRate = {
 async function fetchVariantShippingData(
   variantIds: number[],
   correlationId: string,
-  requestedShopDomain: string | null
+  requestedShopDomain: string | null,
+  adminAccessToken: string | null
 ): Promise<Map<number, VariantShippingData>> {
   const shippingDataMap = new Map<number, VariantShippingData>();
 
-  const adminStoreDomain = requestedShopDomain || SHOPIFY_STORE_DOMAIN;
+  const adminStoreDomain = requestedShopDomain;
 
-  // If we cannot call Shopify Admin, we will fall back to callback grams later.
-  if (!adminStoreDomain || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+  // If we cannot call Shopify Admin safely for this exact shop,
+  // fall back to callback grams later.
+  if (!adminStoreDomain || !adminAccessToken) {
     console.warn(
-      "[Shipwise] Missing Shopify Admin API credentials - exact variant weight lookup disabled; falling back to callback grams",
+      "[Shipwise] Missing per-shop Shopify Admin API credentials - exact variant weight lookup disabled; falling back to callback grams",
       {
-        correlationId,
         adminStoreDomain,
-        hasAdminToken: !!SHOPIFY_ADMIN_ACCESS_TOKEN,
+        hasAdminToken: !!adminAccessToken,
       }
     );
     return shippingDataMap;
@@ -262,7 +270,7 @@ async function fetchVariantShippingData(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+          "X-Shopify-Access-Token": adminAccessToken,
         },
         body: JSON.stringify({
           query,
@@ -274,9 +282,7 @@ async function fetchVariantShippingData(
     if (!response.ok) {
       console.error("[Shipwise] Failed to fetch variant shipping data", {
         status: response.status,
-        correlationId,
         adminStoreDomain,
-      });
       return shippingDataMap;
     }
 
@@ -285,9 +291,7 @@ async function fetchVariantShippingData(
     if (data.errors) {
       console.error("[Shipwise] GraphQL errors fetching variant shipping data", {
         errors: data.errors,
-        correlationId,
         adminStoreDomain,
-      });
       return shippingDataMap;
     }
 
@@ -310,21 +314,16 @@ async function fetchVariantShippingData(
         width,
         height,
         weightLb,
-      });
     }
 
     console.log("[Shipwise] Fetched variant shipping data", {
-      correlationId,
       adminStoreDomain,
       variantCount: shippingDataMap.size,
       variants: Object.fromEntries(shippingDataMap),
-    });
   } catch (err) {
     console.error("[Shipwise] Error fetching variant shipping data", {
       err,
-      correlationId,
       adminStoreDomain,
-    });
   }
 
   return shippingDataMap;
@@ -375,8 +374,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") {
     console.error("[Shipwise] Non-POST request hit /api/shipwise/rates", {
       method: request.method,
-      correlationId,
-    });
     return json({ error: "Method Not Allowed", correlationId }, { status: 405 });
   }
 
@@ -391,16 +388,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     ? await prisma.shipwiseConfig.findUnique({ where: { shop: shopDomain } })
     : null;
 
-  // Optional fallback to env var while setting up
-  const shipwiseBearerToken =
-    config?.bearerToken || process.env.SHIPWISE_BEARER_TOKEN;
+  const shipwiseBearerToken = config?.bearerToken ?? null;
 
   // If no token, do not break checkout — return no rates
   if (!shipwiseBearerToken) {
     console.error("[Shipwise] No token saved for this store", {
-      correlationId,
       shopDomain,
-    });
     return json({ rates: [] }, { status: 200 });
   }
 
@@ -414,8 +407,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   } catch (err) {
     console.error("[Shipwise] Failed to parse Shopify JSON payload", {
       err,
-      correlationId,
-    });
     return json({ rates: [] }, { status: 400 });
   }
 
@@ -423,13 +414,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (!rate) {
     console.error("[Shipwise] Missing rate object in Shopify payload", {
       bodyKeys: Object.keys(shopifyBody || {}),
-      correlationId,
-    });
     return json({ rates: [] }, { status: 400 });
   }
 
   console.log("[Shipwise] Received Shopify rate request", {
-    correlationId,
     shopDomain,
     hasOrigin: !!rate.origin,
     originCountry: rate.origin?.country_code || rate.origin?.country,
@@ -439,7 +427,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     destPostal: rate.destination?.postal_code || rate.destination?.zip,
     itemCount: rate.items?.length ?? 0,
     currency: rate.currency,
-  });
 
   const origin = rate.origin;
   const destination = rate.destination;
@@ -447,8 +434,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (!items.length) {
     console.warn("[Shipwise] No items in Shopify rate request", {
-      correlationId,
-    });
     return json({ rates: [] }, { status: 200 });
   }
 
@@ -464,10 +449,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     .filter((i) => i.variant_id)
     .map((i) => i.variant_id!);
 
+  const shopifyAdminAccessToken =
+    await getOfflineShopAdminAccessToken(shopDomain);
+
   const shippingDataMap = await fetchVariantShippingData(
     variantIds,
-    correlationId,
-    shopDomain
+    shopDomain,
+    shopifyAdminAccessToken
   );
 
   // -------------------------------------------------------------------------
@@ -495,7 +483,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       console.warn(
         "[Shipwise] Using callback grams fallback instead of exact Shopify variant weight",
         {
-          correlationId,
           variantId: item.variant_id,
           sku: item.sku ?? item.name ?? `item-${index + 1}`,
           grams,
@@ -522,7 +509,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       productId: item.product_id,
       variantId: item.variant_id,
     };
-  });
 
   const shipwiseOrigin = convertAddress(origin, "Origin");
   const shipwiseDestination = convertAddress(destination, "Destination");
@@ -537,7 +523,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/shipping-rates`;
 
   console.log("[Shipwise] Sending request to Shipwise API", {
-    correlationId,
     url: shipwiseUrl,
     origin: {
       city: shipwiseOrigin.city,
@@ -573,7 +558,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         dims: `${i.length}x${i.width}x${i.height}`,
       };
     }),
-  });
 
   // -------------------------------------------------------------------------
   // Call Shipwise API
@@ -593,13 +577,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
       body: JSON.stringify(shipwiseRequestBody),
       signal: controller.signal,
-    });
   } catch (err) {
     clearTimeout(timeoutId);
     console.error("[Shipwise] Network error calling Shipwise API", {
       err,
-      correlationId,
-    });
     return json({ rates: [] }, { status: 502 });
   }
 
@@ -612,13 +593,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     console.error("[Shipwise] Failed to parse Shipwise JSON response", {
       status: shipwiseRes.status,
       err,
-      correlationId,
-    });
     return json({ rates: [] }, { status: 502 });
   }
 
   console.log("[Shipwise] Received response from Shipwise", {
-    correlationId,
     status: shipwiseRes.status,
     wasSuccessful: shipwiseJson.wasSuccessful,
     success: shipwiseJson.success,
@@ -632,12 +610,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           ? 1
           : 0,
     rateErrors: shipwiseJson.rateErrors,
-  });
 
-  console.log("[Shipwise] Full Shipwise response body", {
-    correlationId,
-    body: shipwiseJson,
-  });
 
   if (
     !shipwiseRes.ok ||
@@ -646,9 +619,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   ) {
     console.error("[Shipwise] Shipwise API responded with error", {
       status: shipwiseRes.status,
-      body: shipwiseJson,
-      correlationId,
-    });
     return json({ rates: [] }, { status: 502 });
   }
 
@@ -678,7 +648,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           r.estimatedDeliveryDate ?? r.transitTime?.estimatedDeliveryDate ?? null,
         estimatedDeliveryDays:
           r.estimatedDeliveryDays ?? r.transitTime?.estimatedDeliveryDays ?? null,
-      });
     }
   }
 
@@ -697,15 +666,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         r.estimatedDeliveryDate ?? r.transitTime?.estimatedDeliveryDate ?? null,
       estimatedDeliveryDays:
         r.estimatedDeliveryDays ?? r.transitTime?.estimatedDeliveryDays ?? null,
-    });
   }
 
   const topLevelRates = (shipwiseJson as any).rates;
   if (Array.isArray(topLevelRates)) {
     console.log("[Shipwise] Processing top-level Shipwise rates", {
-      correlationId,
       count: topLevelRates.length,
-    });
 
     for (const raw of topLevelRates) {
       if (!raw) continue;
@@ -775,27 +741,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         currency,
         estimatedDeliveryDate,
         estimatedDeliveryDays,
-      });
     }
   }
 
   if (!allRates.length) {
     console.warn("[Shipwise] No usable rates returned from Shipwise", {
-      body: shipwiseJson,
-      correlationId,
-    });
     return json({ rates: [] }, { status: 200 });
   }
 
   console.log("[Shipwise] All rates from Shipwise", {
-    correlationId,
     rates: allRates.map((r) => ({
       service: r.serviceName,
       code: r.serviceCode,
       value: r.value,
       currency: r.currency,
     })),
-  });
 
   // -------------------------------------------------------------------------
   // Find the LOWEST rate
@@ -819,7 +779,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   };
 
   console.log("[Shipwise] Returning LOWEST rate to Shopify", {
-    correlationId,
     selectedRate: {
       service: shopifyRate.service_name,
       code: shopifyRate.service_code,
@@ -827,7 +786,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       currency: shopifyRate.currency,
     },
     allRatesCount: allRates.length,
-  });
 
   return json({ rates: [shopifyRate] }, { status: 200 });
 };

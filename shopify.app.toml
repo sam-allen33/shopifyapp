@@ -3,14 +3,11 @@
 client_id = "b9ecc61bc453badc5b86ebeeb088c1e0"
 name = "shipwise-rate-pull"
 application_url = "https://live-rate-shop.onrender.com"
-
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
 include_config_on_deploy = true
-
-# dev_store_url = "33d-dev.myshopify.com"
 
 [webhooks]
 api_version = "2025-10"
@@ -37,4 +34,3 @@ api_version = "2025-10"
 
 [access_scopes]
 scopes = "read_shipping,write_shipping"
-

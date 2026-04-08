@@ -35,7 +35,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const token = String(formData.get("bearerToken") || "").trim();
 
   if (!token) {
-    const data: ActionData = { ok: false, message: "Paste a token, then save." };
+    const data: ActionData = { ok: false, message: "Please paste your API token, then save." };
     return data;
   }
 
@@ -45,56 +45,60 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     create: { shop, bearerToken: token },
   });
 
-  const data: ActionData = { ok: true, message: "Saved." };
+  const data: ActionData = { ok: true, message: "API token saved successfully." };
   return data;
 };
 
-export default function ShipwiseSettingsPage() {
+export default function SettingsPage() {
   const { shop, hasToken } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData | undefined;
 
   return (
-    <div style={{ padding: 16, maxWidth: 720 }}>
-      <h1>Shipwise Settings</h1>
+    <s-page heading="Settings">
+      <s-section heading="Store">
+        <s-paragraph>
+          Connected store: <strong>{shop}</strong>
+        </s-paragraph>
+      </s-section>
 
-      <p>
-        Store: <code>{shop}</code>
-      </p>
+      <s-section heading="33 Degrees API Token">
+        <s-paragraph>
+          {hasToken
+            ? "Your API token is saved. Paste a new token below to replace it."
+            : "Paste the API token from your 33 Degrees account to connect your store."}
+        </s-paragraph>
 
-      <p>
-        Token saved: <strong>{hasToken ? "Yes" : "No"}</strong>
-      </p>
+        {actionData ? (
+          <s-banner tone={actionData.ok ? "success" : "critical"}>
+            {actionData.message}
+          </s-banner>
+        ) : null}
 
-      {actionData ? (
-        <p style={{ marginTop: 8 }}>
-          <strong>
-            {actionData.ok ? "✅" : "⚠️"} {actionData.message}
-          </strong>
-        </p>
-      ) : null}
-
-      <div style={{ marginTop: 16 }}>
         <Form method="post">
-          <label style={{ display: "block", marginBottom: 8 }}>
-            Shipwise Bearer Token
-          </label>
-
-          <input
+          <s-text-field
+            label="33 Degrees API Token"
             name="bearerToken"
             type="password"
-            autoComplete="off"
-            placeholder="Paste token here"
-            style={{ width: "100%", padding: 10, fontSize: 14 }}
-          />
+            autocomplete="off"
+          ></s-text-field>
 
-          <button
-            type="submit"
-            style={{ marginTop: 12, padding: "10px 14px", fontSize: 14 }}
-          >
-            Save token
-          </button>
+          <div style={{ marginTop: 12 }}>
+            <s-button variant="primary" submit>
+              Save token
+            </s-button>
+          </div>
         </Form>
-      </div>
-    </div>
+      </s-section>
+
+      <s-section slot="aside" heading="Where do I find my token?">
+        <s-paragraph>
+          Your API token is provided by 33 Degrees. If you don't have one,
+          contact us at{" "}
+          <s-link href="mailto:LetsDoThis@33-degrees.com" target="_blank">
+            LetsDoThis@33-degrees.com
+          </s-link>
+        </s-paragraph>
+      </s-section>
+    </s-page>
   );
 }

@@ -2,19 +2,24 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { useLoaderData, useActionData, Form } from "react-router";
 
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
 
 type LoaderData = {
   carrierExists: boolean;
+  hasToken: boolean;
+  shop: string;
 };
 
 type ActionData = {
   message: string;
+  success: boolean;
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
 
-  // Check if carrier service already exists instead of creating every time
+  // Check if carrier service already exists
   const listQuery = `#graphql
     query CarrierServiceList {
       carrierServices(first: 10) {
@@ -34,14 +39,19 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const json = await response.json();
     const carriers = json.data?.carrierServices?.nodes ?? [];
     carrierExists = carriers.some(
-      (c: { name: string }) => c.name === "Shipwise Live Rates"
+      (c: { name: string }) =>
+        c.name === "33 Degrees Live Rates" || c.name === "Shipwise Live Rates"
     );
   } catch (error) {
     if (error instanceof Response) throw error;
     console.error("Error checking carrier services", error);
   }
 
-  return { carrierExists } satisfies LoaderData;
+  // Check if API token is saved
+  const record = await prisma.shipwiseConfig.findUnique({ where: { shop } });
+  const hasToken = Boolean(record?.bearerToken);
+
+  return { carrierExists, hasToken, shop } satisfies LoaderData;
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -69,14 +79,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const variables = {
     input: {
-      name: "Shipwise Live Rates",
+      name: "33 Degrees Live Rates",
       callbackUrl,
       active: true,
       supportsServiceDiscovery: true,
     },
   };
-
-  let message = "Setting up Shipwise Live Rates…";
 
   try {
     const response = await admin.graphql(mutation, { variables });
@@ -86,52 +94,109 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     if (userErrors.length > 0) {
       console.log("CarrierServiceCreate userErrors", userErrors);
-      message =
-        "Shipwise carrier is already set up. Next step: turn it on in Shipping settings.";
-    } else {
-      message =
-        "Shipwise carrier is set up. Next step: turn it on in Shipping settings.";
+      return {
+        message: "Carrier service is already registered.",
+        success: true,
+      } satisfies ActionData;
     }
+
+    return {
+      message: "Carrier service registered successfully.",
+      success: true,
+    } satisfies ActionData;
   } catch (error) {
     if (error instanceof Response) throw error;
     console.error("Error creating carrier service", error);
-    message =
-      "Could not talk to Shopify to create the carrier service. Check Render logs.";
+    return {
+      message: "Something went wrong. Please check logs and try again.",
+      success: false,
+    } satisfies ActionData;
   }
-
-  return { message } satisfies ActionData;
 };
 
 export default function IndexPage() {
-  const { carrierExists } = useLoaderData() as LoaderData;
+  const { carrierExists, hasToken } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData | undefined;
 
+  const carrierReady = carrierExists || actionData?.success;
+
   return (
-    <div style={{ padding: 16 }}>
-      <h1>Shipwise Shopify App</h1>
+    <s-page heading="33 Degrees Live Rates">
+      <s-section heading="Getting started">
+        <s-paragraph>
+          Accurate shipping rates powered by 33 Degrees. Follow the steps below
+          to get your store connected.
+        </s-paragraph>
+      </s-section>
 
-      {actionData ? (
-        <p>{actionData.message}</p>
-      ) : carrierExists ? (
-        <p>
-          Shipwise carrier is already set up. Go to{" "}
-          <strong>Settings → Shipping and delivery</strong> to manage rates.
-        </p>
-      ) : (
-        <>
-          <p>Click the button below to register Shipwise as a shipping rate provider.</p>
-          <Form method="post">
-            <button type="submit" style={{ padding: "10px 14px", fontSize: 14 }}>
-              Set up Shipwise carrier
-            </button>
-          </Form>
-        </>
-      )}
+      <s-section heading="Step 1: Register carrier service">
+        {carrierReady ? (
+          <s-banner tone="success">
+            Carrier service is registered.
+          </s-banner>
+        ) : (
+          <>
+            <s-paragraph>
+              Register 33 Degrees as a shipping rate provider for your store.
+            </s-paragraph>
+            {actionData && !actionData.success ? (
+              <s-banner tone="critical">
+                {actionData.message}
+              </s-banner>
+            ) : null}
+            <Form method="post">
+              <s-button variant="primary" submit>
+                Register carrier service
+              </s-button>
+            </Form>
+          </>
+        )}
+      </s-section>
 
-      <p>
-        Go to <strong>Settings → Shipping and delivery</strong> to turn on the
-        Shipwise rates.
-      </p>
-    </div>
+      <s-section heading="Step 2: Add your API token">
+        {hasToken ? (
+          <s-banner tone="success">
+            API token is saved.{" "}
+            <s-link href="/app/shipwise-settings">Update token</s-link>
+          </s-banner>
+        ) : (
+          <>
+            <s-paragraph>
+              Paste your 33 Degrees API token on the Settings page to connect
+              your account.
+            </s-paragraph>
+            <s-link href="/app/shipwise-settings">
+              <s-button>Go to Settings</s-button>
+            </s-link>
+          </>
+        )}
+      </s-section>
+
+      <s-section heading="Step 3: Enable rates in Shopify">
+        <s-paragraph>
+          Go to <strong>Settings → Shipping and delivery</strong> in your
+          Shopify admin. Find 33 Degrees Live Rates under your shipping profile
+          and turn it on.
+        </s-paragraph>
+      </s-section>
+
+      {carrierReady && hasToken ? (
+        <s-section>
+          <s-banner tone="success">
+            Everything looks good. Your store is ready to show live shipping
+            rates at checkout.
+          </s-banner>
+        </s-section>
+      ) : null}
+
+      <s-section slot="aside" heading="Need help?">
+        <s-paragraph>
+          Contact us at{" "}
+          <s-link href="mailto:LetsDoThis@33-degrees.com" target="_blank">
+            LetsDoThis@33-degrees.com
+          </s-link>
+        </s-paragraph>
+      </s-section>
+    </s-page>
   );
 }

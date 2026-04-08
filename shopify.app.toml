@@ -38,5 +38,3 @@ api_version = "2025-10"
 [access_scopes]
 scopes = "read_shipping,write_shipping"
 
-[auth]
-redirect_urls = [ "https://live-rate-shop.onrender.com/auth/callback" ]

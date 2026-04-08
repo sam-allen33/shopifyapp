@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import prisma from "../db.server";
+import { apiVersion } from "../shopify.server";
 
 // ---------------------------------------------------------------------------
 // Tiny local json() helper (since react-router doesn't export one here)
@@ -354,7 +355,7 @@ async function fetchVariantShippingData(
 
   try {
     const response = await fetch(
-      `https://${adminStoreDomain}/admin/api/2024-10/graphql.json`,
+      `https://${adminStoreDomain}/admin/api/${apiVersion}/graphql.json`,
       {
         method: "POST",
         headers: {

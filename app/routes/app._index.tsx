@@ -1,13 +1,50 @@
-import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData } from "react-router";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useActionData, Form } from "react-router";
 
 import { authenticate } from "../shopify.server";
 
 type LoaderData = {
+  carrierExists: boolean;
+};
+
+type ActionData = {
   message: string;
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { admin } = await authenticate.admin(request);
+
+  // Check if carrier service already exists instead of creating every time
+  const listQuery = `#graphql
+    query CarrierServiceList {
+      carrierServices(first: 10) {
+        nodes {
+          id
+          name
+          active
+        }
+      }
+    }
+  `;
+
+  let carrierExists = false;
+
+  try {
+    const response = await admin.graphql(listQuery);
+    const json = await response.json();
+    const carriers = json.data?.carrierServices?.nodes ?? [];
+    carrierExists = carriers.some(
+      (c: { name: string }) => c.name === "Shipwise Live Rates"
+    );
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    console.error("Error checking carrier services", error);
+  }
+
+  return { carrierExists } satisfies LoaderData;
+};
+
+export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
 
   const mutation = `#graphql
@@ -56,26 +93,41 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         "Shipwise carrier is set up. Next step: turn it on in Shipping settings.";
     }
   } catch (error) {
-    // ✅ IMPORTANT: Shopify throws redirect Responses (302) that MUST be re-thrown
-    if (error instanceof Response) {
-      throw error;
-    }
-
+    if (error instanceof Response) throw error;
     console.error("Error creating carrier service", error);
     message =
       "Could not talk to Shopify to create the carrier service. Check Render logs.";
   }
 
-  return { message } satisfies LoaderData;
+  return { message } satisfies ActionData;
 };
 
 export default function IndexPage() {
-  const data = useLoaderData() as LoaderData;
+  const { carrierExists } = useLoaderData() as LoaderData;
+  const actionData = useActionData() as ActionData | undefined;
 
   return (
     <div style={{ padding: 16 }}>
       <h1>Shipwise Shopify App</h1>
-      <p>{data.message}</p>
+
+      {actionData ? (
+        <p>{actionData.message}</p>
+      ) : carrierExists ? (
+        <p>
+          Shipwise carrier is already set up. Go to{" "}
+          <strong>Settings → Shipping and delivery</strong> to manage rates.
+        </p>
+      ) : (
+        <>
+          <p>Click the button below to register Shipwise as a shipping rate provider.</p>
+          <Form method="post">
+            <button type="submit" style={{ padding: "10px 14px", fontSize: 14 }}>
+              Set up Shipwise carrier
+            </button>
+          </Form>
+        </>
+      )}
+
       <p>
         Go to <strong>Settings → Shipping and delivery</strong> to turn on the
         Shipwise rates.

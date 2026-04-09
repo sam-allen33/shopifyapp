@@ -16,27 +16,18 @@ type ActionData = {
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-
   const record = await prisma.shipwiseConfig.findUnique({ where: { shop } });
-
-  const data: LoaderData = {
-    shop,
-    hasToken: Boolean(record?.bearerToken),
-  };
-
-  return data;
+  return { shop, hasToken: Boolean(record?.bearerToken) } satisfies LoaderData;
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-
   const formData = await request.formData();
   const token = String(formData.get("bearerToken") || "").trim();
 
   if (!token) {
-    const data: ActionData = { ok: false, message: "Paste a token, then save." };
-    return data;
+    return { ok: false, message: "Please paste your API token, then save." } satisfies ActionData;
   }
 
   await prisma.shipwiseConfig.upsert({
@@ -45,56 +36,51 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     create: { shop, bearerToken: token },
   });
 
-  const data: ActionData = { ok: true, message: "Saved." };
-  return data;
+  return { ok: true, message: "API token saved successfully." } satisfies ActionData;
 };
 
-export default function ShipwiseSettingsPage() {
+export default function SettingsPage() {
   const { shop, hasToken } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData | undefined;
 
   return (
-    <div style={{ padding: 16, maxWidth: 720 }}>
-      <h1>Shipwise Settings</h1>
+    <s-page heading="Settings">
+      <s-section heading="Store">
+        <s-paragraph>Connected store: <strong>{shop}</strong></s-paragraph>
+      </s-section>
 
-      <p>
-        Store: <code>{shop}</code>
-      </p>
+      <s-section heading="33 Degrees API Token">
+        <s-paragraph>
+          {hasToken
+            ? "Your API token is saved. Paste a new token below to replace it."
+            : "Paste the API token from your 33 Degrees account to connect your store."}
+        </s-paragraph>
 
-      <p>
-        Token saved: <strong>{hasToken ? "Yes" : "No"}</strong>
-      </p>
+        {actionData ? (
+          <s-banner tone={actionData.ok ? "success" : "critical"}>{actionData.message}</s-banner>
+        ) : null}
 
-      {actionData ? (
-        <p style={{ marginTop: 8 }}>
-          <strong>
-            {actionData.ok ? "✅" : "⚠️"} {actionData.message}
-          </strong>
-        </p>
-      ) : null}
-
-      <div style={{ marginTop: 16 }}>
         <Form method="post">
-          <label style={{ display: "block", marginBottom: 8 }}>
-            Shipwise Bearer Token
-          </label>
-
-          <input
-            name="bearerToken"
-            type="password"
-            autoComplete="off"
-            placeholder="Paste token here"
-            style={{ width: "100%", padding: 10, fontSize: 14 }}
-          />
-
-          <button
-            type="submit"
-            style={{ marginTop: 12, padding: "10px 14px", fontSize: 14 }}
-          >
-            Save token
-          </button>
+          <div style={{ marginBottom: 8 }}>
+            <label htmlFor="bearerToken" style={{ display: "block", marginBottom: 4, fontSize: 14 }}>33 Degrees API Token</label>
+            <input
+              id="bearerToken"
+              name="bearerToken"
+              type="password"
+              autoComplete="off"
+              placeholder="Paste token here"
+              style={{ width: "100%", padding: 10, fontSize: 14, boxSizing: "border-box" }}
+            />
+          </div>
+          <button type="submit" style={{ padding: "8px 16px", fontSize: 14, cursor: "pointer" }}>Save token</button>
         </Form>
-      </div>
-    </div>
+      </s-section>
+
+      <s-section slot="aside" heading="Where do I find my token?">
+        <s-paragraph>
+          Your API token is provided by 33 Degrees. If you do not have one, contact us at LetsDoThis@33-degrees.com
+        </s-paragraph>
+      </s-section>
+    </s-page>
   );
 }

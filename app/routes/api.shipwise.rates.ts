@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import prisma from "../db.server";
+import { apiVersion } from "../shopify.server";
 
 function json(data: unknown, init?: number | ResponseInit): Response {
   const body = JSON.stringify(data);
@@ -252,7 +253,7 @@ function logDebug(message: string, details: Record<string, unknown>) {
 
   try {
     const response = await fetch(
-      `https://${adminStoreDomain}/admin/api/2024-10/graphql.json`,
+      `https://${adminStoreDomain}/admin/api/${apiVersion}/graphql.json`,
       {
         method: "POST",
         headers: {

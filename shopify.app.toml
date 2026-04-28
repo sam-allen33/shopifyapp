@@ -32,7 +32,7 @@ api_version = "2025-10"
   uri = "/webhooks/shop/redact"
 
 [access_scopes]
-scopes = "read_shipping,write_shipping"
+scopes = "read_shipping,write_shipping,read_products"
 
 [auth]
 redirect_urls = [ "https://shopifyapp-e92y.onrender.com/auth/callback" ]

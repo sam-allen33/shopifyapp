@@ -37,13 +37,11 @@ const SHIPWISE_API_URL =
 const SHIPWISE_DEBUG_VERBOSE =
   (process.env.SHIPWISE_DEBUG_VERBOSE ?? "false").toLowerCase() === "true";
 
-const SHIPWISE_SHIP_METHOD = process.env.SHIPWISE_SHIP_METHOD ?? "";
-
-const SHIPWISE_CUSTOMS_SIGNER =
-  process.env.SHIPWISE_CUSTOMS_SIGNER ?? "33 Degrees";
-
 const SHIPWISE_DEFAULT_HS_CODE =
   process.env.SHIPWISE_DEFAULT_HS_CODE ?? "";
+
+const SHIPWISE_DEFAULT_ORIGIN_COUNTRY =
+  process.env.SHIPWISE_DEFAULT_ORIGIN_COUNTRY ?? "";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -138,16 +136,15 @@ type ShipwiseAddress = {
   email: string;
 };
 
-type ShipwiseItem = {
+// Internal item — includes fields needed for package building that are not
+// sent in the Shipwise items array.
+type ShipwiseItemInternal = {
   id: number;
   sku: string;
-  description: string;
+  marketProductKey: string;
   title: string;
-  quantity: number;
   quantityToShip: number;
   quantityOrdered: number;
-  weight: number;
-  price: number;
   unitPrice: number;
   unitCustoms: number;
   length: number;
@@ -157,9 +154,11 @@ type ShipwiseItem = {
   variantId?: number;
   countryOfOrigin: string;
   provinceOfOrigin: string;
+  countryOfMfg: string;
   harmonizedCode: string;
   customsDescription: string;
   customsDeclaredValue: number;
+  weightLb: number; // per-unit, used only for package/customs building
 };
 
 type ShipwiseRate = {
@@ -212,6 +211,7 @@ type OperationalLogDetails = {
   latencyMs: number;
   itemCount: number;
   ratesCount: number;
+  [key: string]: unknown;
 };
 
 // ---------------------------------------------------------------------------
@@ -323,34 +323,76 @@ function shopifyWeightToPounds(
 // Country, region, and HS-code normalization helpers
 // ---------------------------------------------------------------------------
 
+const COUNTRY_NAME_MAP: Record<string, string> = {
+  // North America
+  "united states": "US",
+  "united states of america": "US",
+  usa: "US",
+  canada: "CA",
+  mexico: "MX",
+  // Europe
+  "united kingdom": "GB",
+  "great britain": "GB",
+  uk: "GB",
+  england: "GB",
+  scotland: "GB",
+  wales: "GB",
+  germany: "DE",
+  france: "FR",
+  italy: "IT",
+  spain: "ES",
+  netherlands: "NL",
+  holland: "NL",
+  belgium: "BE",
+  switzerland: "CH",
+  austria: "AT",
+  sweden: "SE",
+  norway: "NO",
+  denmark: "DK",
+  finland: "FI",
+  portugal: "PT",
+  ireland: "IE",
+  poland: "PL",
+  "czech republic": "CZ",
+  czechia: "CZ",
+  // Asia-Pacific
+  australia: "AU",
+  "new zealand": "NZ",
+  japan: "JP",
+  china: "CN",
+  "south korea": "KR",
+  korea: "KR",
+  singapore: "SG",
+  "hong kong": "HK",
+  taiwan: "TW",
+  india: "IN",
+  // South America
+  brazil: "BR",
+  argentina: "AR",
+  chile: "CL",
+  colombia: "CO",
+  // Middle East / Africa
+  "united arab emirates": "AE",
+  uae: "AE",
+  israel: "IL",
+  "south africa": "ZA",
+};
+
 function normalizeCountryCode(country: string | null | undefined): string {
   if (!country) return "";
 
   const value = country.trim();
   if (!value) return "";
 
-  const upper = value.toUpperCase();
-
-  // Shopify normally sends ISO-2 country codes like US, CA, GB, FR.
-  if (/^[A-Z]{2}$/.test(upper)) {
-    return upper;
+  // Any 2-letter input is already ISO-2 — just uppercase it.
+  if (/^[A-Za-z]{2}$/.test(value)) {
+    return value.toUpperCase();
   }
 
-  // Small fallback list only. Do not manually map every country.
-  const countryMap: Record<string, string> = {
-    canada: "CA",
-    "united states": "US",
-    "united states of america": "US",
-    usa: "US",
-    "united kingdom": "GB",
-    "great britain": "GB",
-    uk: "GB",
-  };
-
-  const mapped = countryMap[value.toLowerCase()];
+  const mapped = COUNTRY_NAME_MAP[value.toLowerCase()];
   if (mapped) return mapped;
 
-  console.warn("[Shipwise] Country was not a 2-letter ISO code", {
+  console.warn("[Shipwise] Country not recognized as ISO-2 or known name", {
     country,
   });
 
@@ -440,7 +482,7 @@ function summarizeIncomingRequest(
 }
 
 function summarizePreparedItems(
-  items: ShipwiseItem[],
+  items: ShipwiseItemInternal[],
   shippingDataMap: Map<number, VariantShippingData>,
 ) {
   return items.map((item) => {
@@ -450,8 +492,8 @@ function summarizePreparedItems(
         : undefined;
 
     return {
-      quantity: item.quantity,
-      weightLb: Number(item.weight.toFixed(6)),
+      quantity: item.quantityToShip,
+      weightLb: Number(item.weightLb.toFixed(6)),
       dimensions: `${item.length}x${item.width}x${item.height}`,
       weightSource:
         variantData?.weightLb != null && variantData.weightLb > 0
@@ -699,81 +741,6 @@ function convertAddress(
 }
 
 // ---------------------------------------------------------------------------
-// Shipwise package/customs helper
-// ---------------------------------------------------------------------------
-
-function createShipwisePackages(
-  isInternational: boolean,
-  correlationId: string,
-  shipwiseItems: ShipwiseItem[],
-  shipwiseOrigin: ShipwiseAddress,
-) {
-  if (!isInternational) return [];
-
-  const totalShipmentWeightLb = shipwiseItems.reduce(
-    (sum, item) => sum + item.weight * item.quantity,
-    0,
-  );
-
-  const totalShipmentValue = shipwiseItems.reduce(
-    (sum, item) => sum + item.price * item.quantity,
-    0,
-  );
-
-  const packageLength = Math.max(
-    DEFAULT_DIMENSIONS.length,
-    ...shipwiseItems.map((item) => item.length),
-  );
-
-  const packageWidth = Math.max(
-    DEFAULT_DIMENSIONS.width,
-    ...shipwiseItems.map((item) => item.width),
-  );
-
-  const packageHeight = Math.max(
-    DEFAULT_DIMENSIONS.height,
-    ...shipwiseItems.map((item) => item.height),
-  );
-
-  return [
-    {
-      packageId: correlationId,
-      weightUnit: "LB",
-      contentWeight: Number(totalShipmentWeightLb.toFixed(6)),
-      totalWeight: Number(totalShipmentWeightLb.toFixed(6)),
-      value: Number(totalShipmentValue.toFixed(2)),
-      packaging: {
-        length: packageLength,
-        width: packageWidth,
-        height: packageHeight,
-      },
-      customs: {
-        contentsDescription: "Merchandise",
-        originCountry: shipwiseOrigin.countryCode || "US",
-        signer: SHIPWISE_CUSTOMS_SIGNER,
-        customsTag: "Merchandise",
-        items: shipwiseItems.map((item) => ({
-          itemMarketProductKey:
-            item.variantId?.toString() ??
-            item.productId?.toString() ??
-            item.sku,
-          sku: item.sku,
-          productSku: item.sku,
-          description: item.customsDescription,
-          qty: item.quantity,
-          value: item.price,
-          weight: item.weight,
-          countryOfMfg:
-            item.countryOfOrigin || shipwiseOrigin.countryCode || "US",
-          stateOrProvOfMfg: item.provinceOfOrigin,
-          harmCode: item.harmonizedCode,
-        })),
-      },
-    },
-  ];
-}
-
-// ---------------------------------------------------------------------------
 // Rate normalization helpers
 // ---------------------------------------------------------------------------
 
@@ -790,6 +757,13 @@ function extractNumericValue(value: unknown): number | null {
   return null;
 }
 
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
 function appendNormalizedRate(
   allRates: NormalizedShipwiseRate[],
   rate: ShipwiseRate | null | undefined,
@@ -800,18 +774,25 @@ function appendNormalizedRate(
 
   const valueInDollars = SHIPWISE_RETURNS_CENTS ? rate.value / 100 : rate.value;
 
+  const serviceName =
+    rate.carrierService ??
+    rate.class ??
+    rate.carrier ??
+    rate.carrierCode ??
+    "Shipping";
+
+  // Stable service_code: prefer carrierService slug, then carrierCode, then class.
+  const serviceCode = rate.carrierService
+    ? slugify(rate.carrierService)
+    : rate.carrierCode
+      ? slugify(rate.carrierCode)
+      : rate.class
+        ? slugify(rate.class)
+        : fallbackServiceCode;
+
   allRates.push({
-    serviceName:
-      rate.carrierService ??
-      rate.class ??
-      rate.carrier ??
-      rate.carrierCode ??
-      "Shipping",
-    serviceCode:
-      rate.carrierService ??
-      rate.carrierCode ??
-      rate.class ??
-      fallbackServiceCode,
+    serviceName,
+    serviceCode,
     value: valueInDollars,
     currency: rate.currencyCodeIso ?? fallbackCurrency,
     estimatedDeliveryDate:
@@ -858,16 +839,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const shipwiseBearerToken = config?.bearerToken ?? null;
 
-  if (!shipwiseBearerToken) {
-    logOperational("warn", "[Shipwise] No Shipwise token configured", {
-      correlationId,
-      shopDomain,
-      requestSuccess: false,
-      responseStatus: 200,
-      latencyMs: Date.now() - startedAt,
-      itemCount: 0,
-      ratesCount: 0,
-    });
+  // CHANGE 10: Fail loudly in logs when any required config is missing.
+  if (!SHIPWISE_API_URL || !shipwiseBearerToken) {
+    const missingConfig = !SHIPWISE_API_URL
+      ? "SHIPWISE_API_URL not set"
+      : "no Shipwise bearer token for shop";
+
+    logOperational(
+      "warn",
+      `[Shipwise] Misconfiguration — returning empty rates: ${missingConfig}`,
+      {
+        correlationId,
+        shopDomain,
+        requestSuccess: false,
+        responseStatus: 200,
+        latencyMs: Date.now() - startedAt,
+        itemCount: 0,
+        ratesCount: 0,
+        missingConfig,
+      },
+    );
 
     return json({ rates: [] }, { status: 200 });
   }
@@ -935,6 +926,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shipwiseOrigin = convertAddress(rate.origin, "Origin");
   const shipwiseDestination = convertAddress(rate.destination, "Destination");
 
+  // CHANGE 5: Fail if destination country normalization yields a blank code.
+  if (!shipwiseDestination.countryCode) {
+    const rawDestinationCountry =
+      rate.destination?.country_code ?? rate.destination?.country ?? null;
+
+    logOperational(
+      "warn",
+      "[Shipwise] Destination country normalization failed — returning empty rates",
+      {
+        correlationId,
+        shopDomain,
+        requestSuccess: false,
+        responseStatus: 200,
+        latencyMs: Date.now() - startedAt,
+        itemCount: shippableItems.length,
+        ratesCount: 0,
+        rawDestinationCountry,
+      },
+    );
+
+    return json({ rates: [] }, { status: 200 });
+  }
+
   const isInternational =
     Boolean(shipwiseOrigin.countryCode) &&
     Boolean(shipwiseDestination.countryCode) &&
@@ -965,6 +979,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shopifyAdminAccessToken =
     await getOfflineShopAdminAccessToken(shopDomain);
 
+  // CHANGE 9: Log when admin token is missing (non-fatal, but variant data unavailable).
+  if (!shopifyAdminAccessToken) {
+    console.warn("[Shipwise] Admin token missing for shop — variant data unavailable", {
+      correlationId,
+      shopDomain,
+    });
+  }
+
   const shippingDataMap = await fetchVariantShippingData(
     variantIds,
     correlationId,
@@ -972,85 +994,97 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     shopifyAdminAccessToken,
   );
 
-  const shipwiseItems: ShipwiseItem[] = shippableItems.map((item, index) => {
-    const quantity = item.quantity ?? 1;
-    const grams = item.grams ?? 0;
+  const shipwiseItems: ShipwiseItemInternal[] = shippableItems.map(
+    (item, index) => {
+      const quantity = item.quantity ?? 1;
+      const grams = item.grams ?? 0;
 
-    const variantData =
-      typeof item.variant_id === "number"
-        ? shippingDataMap.get(item.variant_id)
-        : undefined;
+      const variantData =
+        typeof item.variant_id === "number"
+          ? shippingDataMap.get(item.variant_id)
+          : undefined;
 
-    const hasVariantWeight =
-      typeof variantData?.weightLb === "number" &&
-      Number.isFinite(variantData.weightLb) &&
-      variantData.weightLb > 0;
+      const hasVariantWeight =
+        typeof variantData?.weightLb === "number" &&
+        Number.isFinite(variantData.weightLb) &&
+        variantData.weightLb > 0;
 
-    const weightPerItemLb = hasVariantWeight
-      ? (variantData?.weightLb as number)
-      : gramsToPoundsExact(grams);
+      const weightLb = hasVariantWeight
+        ? (variantData?.weightLb as number)
+        : gramsToPoundsExact(grams);
 
-    const price = Number(((item.price ?? 0) / 100).toFixed(2));
-    const sku = item.sku ?? item.name ?? `item-${index + 1}`;
-    const description = item.name ?? item.sku ?? "Item";
-    const destinationCountryCode = shipwiseDestination.countryCode;
+      const unitPrice = Number(((item.price ?? 0) / 100).toFixed(2));
+      const sku = item.sku ?? item.name ?? `item-${index + 1}`;
+      const title = item.name ?? item.sku ?? "Item";
+      const destinationCountryCode = shipwiseDestination.countryCode;
 
-    const countryOfOrigin =
-      variantData?.countryOfOrigin ?? shipwiseOrigin.countryCode ?? "";
+      const countryOfOrigin =
+        variantData?.countryOfOrigin ?? shipwiseOrigin.countryCode ?? "";
 
-    const provinceOfOrigin = variantData?.provinceOfOrigin ?? "";
+      const provinceOfOrigin = variantData?.provinceOfOrigin ?? "";
 
-    const harmonizedCode =
-      normalizeHarmonizedCode(
-        destinationCountryCode
-          ? variantData?.countrySpecificHarmonizedCodes?.[
-              destinationCountryCode
-            ]
-          : undefined,
-      ) ||
-      normalizeHarmonizedCode(variantData?.harmonizedCode) ||
-      normalizeHarmonizedCode(SHIPWISE_DEFAULT_HS_CODE);
+      // CHANGE 6: countryOfMfg fallback chain.
+      const countryOfMfg =
+        variantData?.countryOfOrigin ||
+        shipwiseOrigin.countryCode ||
+        SHIPWISE_DEFAULT_ORIGIN_COUNTRY ||
+        "US";
 
-    if (isInternational && !countryOfOrigin) {
-      console.warn("[Shipwise] Missing country of origin for international item", {
-        correlationId,
-        variantId: item.variant_id,
+      const harmonizedCode =
+        normalizeHarmonizedCode(
+          destinationCountryCode
+            ? variantData?.countrySpecificHarmonizedCodes?.[
+                destinationCountryCode
+              ]
+            : undefined,
+        ) ||
+        normalizeHarmonizedCode(variantData?.harmonizedCode) ||
+        normalizeHarmonizedCode(SHIPWISE_DEFAULT_HS_CODE);
+
+      const marketProductKey =
+        item.variant_id?.toString() ??
+        item.product_id?.toString() ??
+        sku;
+
+      // CHANGE 9: Operational log for missing international data after fallbacks.
+      if (isInternational && !countryOfOrigin) {
+        console.warn(
+          "[Shipwise] International item missing country of origin after fallbacks",
+          { correlationId, itemIndex: index, hasVariantId: typeof item.variant_id === "number" },
+        );
+      }
+
+      if (isInternational && !harmonizedCode) {
+        console.warn(
+          "[Shipwise] International item missing HS code after fallbacks",
+          { correlationId, itemIndex: index, hasVariantId: typeof item.variant_id === "number" },
+        );
+      }
+
+      return {
+        id: index + 1,
         sku,
-      });
-    }
-
-    if (isInternational && !harmonizedCode) {
-      console.warn("[Shipwise] Missing HS code for international item", {
-        correlationId,
+        marketProductKey,
+        title,
+        quantityToShip: quantity,
+        quantityOrdered: quantity,
+        unitPrice,
+        unitCustoms: unitPrice,
+        length: variantData?.length ?? DEFAULT_DIMENSIONS.length,
+        width: variantData?.width ?? DEFAULT_DIMENSIONS.width,
+        height: variantData?.height ?? DEFAULT_DIMENSIONS.height,
+        productId: item.product_id,
         variantId: item.variant_id,
-        sku,
-      });
-    }
-
-    return {
-      id: index + 1,
-      sku,
-      description,
-      title: description,
-      quantity,
-      quantityToShip: quantity,
-      quantityOrdered: quantity,
-      weight: weightPerItemLb,
-      price,
-      unitPrice: price,
-      unitCustoms: price,
-      length: variantData?.length ?? DEFAULT_DIMENSIONS.length,
-      width: variantData?.width ?? DEFAULT_DIMENSIONS.width,
-      height: variantData?.height ?? DEFAULT_DIMENSIONS.height,
-      productId: item.product_id,
-      variantId: item.variant_id,
-      countryOfOrigin,
-      provinceOfOrigin,
-      harmonizedCode,
-      customsDescription: description,
-      customsDeclaredValue: price,
-    };
-  });
+        countryOfOrigin,
+        provinceOfOrigin,
+        countryOfMfg,
+        harmonizedCode,
+        customsDescription: title,
+        customsDeclaredValue: unitPrice,
+        weightLb,
+      };
+    },
+  );
 
   logDebug("[Shipwise] Prepared redacted request summary", {
     correlationId,
@@ -1060,38 +1094,39 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     items: summarizePreparedItems(shipwiseItems, shippingDataMap),
   });
 
-  const shipwisePackages = createShipwisePackages(
-    isInternational,
-    correlationId,
-    shipwiseItems,
-    shipwiseOrigin,
-  );
-
   const shipwiseRequestBody = {
-    items: shipwiseItems,
-
-    // Keep the old field names because domestic US rating is already working.
-    origin: shipwiseOrigin,
-    destination: shipwiseDestination,
-
-    // Also send Shipwise's documented field names for international rating.
-    ...(isInternational
-      ? {
-          from: shipwiseOrigin,
-          to: shipwiseDestination,
-          packages: shipwisePackages,
-        }
-      : {}),
-
-    ...(SHIPWISE_SHIP_METHOD ? { shipMethod: SHIPWISE_SHIP_METHOD } : {}),
-
-    currency: shopCurrency,
+    items: shipwiseItems.map((item) => ({
+      sku: item.sku,
+      description: item.customsDescription,
+      quantity: item.quantityToShip,
+      weight: item.weightLb,
+      length: item.length,
+      width: item.width,
+      height: item.height,
+      value: item.unitPrice,
+      countryOfOrigin: item.countryOfOrigin,
+      harmonizedCode: item.harmonizedCode,
+      customsDescription: item.customsDescription,
+    })),
+    destination: {
+      name: shipwiseDestination.name,
+      company: shipwiseDestination.company,
+      address1: shipwiseDestination.address1,
+      address2: shipwiseDestination.address2,
+      city: shipwiseDestination.city,
+      state: shipwiseDestination.state,
+      zip: shipwiseDestination.postalCode,
+      country: shipwiseDestination.countryCode,
+      phone: shipwiseDestination.phone,
+      email: shipwiseDestination.email,
+    },
   };
 
   const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/shipping-rates`;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  // CHANGE 8: 6 s timeout (Shopify budget is ~10 s; leave headroom for parsing).
+  const timeoutId = setTimeout(() => controller.abort(), 6000);
 
   let shipwiseRes: Response;
 
@@ -1192,12 +1227,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
 
     for (const shipmentRate of shipmentItem.rates ?? []) {
-      appendNormalizedRate(
-        allRates,
-        shipmentRate,
-        shopCurrency,
-        "standard",
-      );
+      appendNormalizedRate(allRates, shipmentRate, shopCurrency, "standard");
     }
   }
 
@@ -1238,12 +1268,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         (record.carrierCode as string | undefined) ??
         "Shipping";
 
-      const serviceCode =
+      const rawServiceCode =
         (record.serviceCode as string | undefined) ??
         (record.carrierService as string | undefined) ??
         (record.carrierCode as string | undefined) ??
-        (record.class as string | undefined) ??
-        "standard";
+        (record.class as string | undefined);
+
+      const serviceCode = rawServiceCode ? slugify(rawServiceCode) : "standard";
 
       const estimatedDeliveryDays =
         (record.estimatedDeliveryDays as number | null | undefined) ??
@@ -1290,38 +1321,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ rates: [] }, { status: 200 });
   }
 
-  const lowestRate = allRates.reduce((min, current) =>
-    current.value < min.value ? current : min,
-  );
+  // CHANGE 7: Return ALL rates, not just the cheapest.
+  const shopifyRates = allRates.map((normalizedRate) => {
+    const totalPriceCents = Math.round(normalizedRate.value * 100);
 
-  const totalPriceCents = Math.round(lowestRate.value * 100);
+    return {
+      service_name: normalizedRate.serviceName,
+      service_code: normalizedRate.serviceCode,
+      description:
+        normalizedRate.estimatedDeliveryDays != null
+          ? `Estimated delivery in ${normalizedRate.estimatedDeliveryDays} business days`
+          : "Live shipping rate calculated by 33 Degrees",
+      total_price: totalPriceCents.toString(),
+      currency: normalizedRate.currency ?? shopCurrency,
+      ...(normalizedRate.estimatedDeliveryDate
+        ? {
+            min_delivery_date: normalizedRate.estimatedDeliveryDate,
+            max_delivery_date: normalizedRate.estimatedDeliveryDate,
+          }
+        : {}),
+    };
+  });
 
-  const shopifyRate = {
-    service_name: lowestRate.serviceName,
-    service_code: lowestRate.serviceCode,
-    description:
-      lowestRate.estimatedDeliveryDays != null
-        ? `Estimated delivery in ${lowestRate.estimatedDeliveryDays} business days`
-        : "Live shipping rate calculated by 33 Degrees",
-    total_price: totalPriceCents.toString(),
-    currency: lowestRate.currency ?? shopCurrency,
-    ...(lowestRate.estimatedDeliveryDate
-      ? {
-          min_delivery_date: lowestRate.estimatedDeliveryDate,
-          max_delivery_date: lowestRate.estimatedDeliveryDate,
-        }
-      : {}),
-  };
-
-  logOperational("info", "[Shipwise] Returning rate to Shopify", {
+  logOperational("info", "[Shipwise] Returning rates to Shopify", {
     correlationId,
     shopDomain,
     requestSuccess: true,
     responseStatus: 200,
     latencyMs: Date.now() - startedAt,
     itemCount: shippableItems.length,
-    ratesCount: allRates.length,
+    ratesCount: shopifyRates.length,
   });
 
-  return json({ rates: [shopifyRate] }, { status: 200 });
+  return json({ rates: shopifyRates }, { status: 200 });
 };

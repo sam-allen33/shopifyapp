@@ -6,6 +6,7 @@ import prisma from "../db.server";
 type LoaderData = {
   shop: string;
   hasToken: boolean;
+  hasShipMethod: boolean;
 };
 
 type ActionData = {
@@ -17,7 +18,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
   const record = await prisma.shipwiseConfig.findUnique({ where: { shop } });
-  return { shop, hasToken: Boolean(record?.bearerToken) } satisfies LoaderData;
+  return {
+    shop,
+    hasToken: Boolean(record?.bearerToken),
+    hasShipMethod: Boolean(process.env.SHIPWISE_SHIP_METHOD),
+  } satisfies LoaderData;
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -40,11 +45,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function SettingsPage() {
-  const { shop, hasToken } = useLoaderData() as LoaderData;
+  const { shop, hasToken, hasShipMethod } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData | undefined;
 
   return (
     <s-page heading="Settings">
+      {!hasShipMethod && (
+        <s-banner tone="warning">
+          Shipping rates are disabled: the <strong>SHIPWISE_SHIP_METHOD</strong> environment
+          variable is not set on the server. Contact 33 Degrees at LetsDoThis@33-degrees.com
+          to obtain the correct value, then add it to your Render environment variables.
+        </s-banner>
+      )}
+
       <s-section heading="Store">
         <s-paragraph>Connected store: <strong>{shop}</strong></s-paragraph>
       </s-section>

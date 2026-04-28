@@ -2,6 +2,10 @@ import type { ActionFunctionArgs } from "react-router";
 import prisma from "../db.server";
 import { apiVersion } from "../shopify.server";
 
+// ---------------------------------------------------------------------------
+// Tiny local json() helper (since react-router doesn't export one here)
+// ---------------------------------------------------------------------------
+
 function json(data: unknown, init?: number | ResponseInit): Response {
   const body = JSON.stringify(data);
 
@@ -33,10 +37,19 @@ const SHIPWISE_API_URL =
 const SHIPWISE_DEBUG_VERBOSE =
   (process.env.SHIPWISE_DEBUG_VERBOSE ?? "false").toLowerCase() === "true";
 
-// Set to true if Shipwise returns rates in CENTS instead of dollars
+const SHIPWISE_SHIP_METHOD = process.env.SHIPWISE_SHIP_METHOD ?? "";
+
+const SHIPWISE_CUSTOMS_SIGNER =
+  process.env.SHIPWISE_CUSTOMS_SIGNER ?? "33 Degrees";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Set to true if Shipwise returns rates in CENTS instead of dollars.
 const SHIPWISE_RETURNS_CENTS = false;
 
-// Metafield namespace and keys for product dimensions
+// Metafield namespace and keys for product dimensions.
 const DIMENSION_METAFIELD_NAMESPACE = "shipping";
 const DIMENSION_KEYS = {
   length: "length",
@@ -44,75 +57,12 @@ const DIMENSION_KEYS = {
   height: "height",
 };
 
-// Default dimensions if metafields are not set (fallback)
+// Default dimensions if metafields are not set (fallback), in inches.
 const DEFAULT_DIMENSIONS = {
   length: 10,
   width: 8,
   height: 4,
 };
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function createCorrelationId() {
-  return `shipwise-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function logInfo(message: string, details: Record<string, unknown>) {
-  console.log(message, details);
-}
-
-function logDebug(message: string, details: Record<string, unknown>) {
-  if (SHIPWISE_DEBUG_VERBOSE) console.log(message, details);
-}
-
-async function getOfflineShopAdminAccessToken(
-  shopDomain: string | null
-): Promise<string | null> {
-  if (!shopDomain) return null;
-
-  const offlineSession = await prisma.session.findFirst({
-    where: {
-      shop: shopDomain,
-      isOnline: false,
-    },
-    select: {
-      accessToken: true,
-    },
-  });
-
-  return offlineSession?.accessToken ?? null;
-}
-
-// ---------------------------------------------------------------------------
-// Weight conversion helpers
-// ---------------------------------------------------------------------------
-
-function gramsToPoundsExact(grams: number) {
-  if (!Number.isFinite(grams) || grams <= 0) return 0;
-  return Number((grams / 453.59237).toFixed(6));
-}
-
-function shopifyWeightToPounds(
-  weight: number | null | undefined,
-  weightUnit: string | null | undefined
-): number | null {
-  if (weight == null || !Number.isFinite(weight) || weight <= 0) return null;
-
-  switch (weightUnit) {
-    case "POUNDS":
-      return Number(weight.toFixed(6));
-    case "OUNCES":
-      return Number((weight / 16).toFixed(6));
-    case "KILOGRAMS":
-      return Number((weight * 2.20462262185).toFixed(6));
-    case "GRAMS":
-      return Number((weight / 453.59237).toFixed(6));
-    default:
-      return null;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,8 +79,11 @@ type ShopifyAddress = {
   name?: string | null;
   address1?: string;
   address2?: string;
+  address3?: string | null;
   phone?: string | null;
   email?: string | null;
+  company?: string | null;
+  company_name?: string | null;
 };
 
 type ShopifyCartItem = {
@@ -138,10 +91,13 @@ type ShopifyCartItem = {
   sku?: string;
   quantity?: number;
   grams?: number;
-  price?: number;
+  price?: number; // cents
   requires_shipping?: boolean;
-  variant_id?: number;
   product_id?: number;
+  variant_id?: number;
+  properties?: Record<string, unknown> | null;
+  vendor?: string;
+  fulfillment_service?: string;
 };
 
 type ShopifyRateRequest = {
@@ -150,6 +106,7 @@ type ShopifyRateRequest = {
     destination?: ShopifyAddress;
     items?: ShopifyCartItem[];
     currency?: string;
+    locale?: string;
   };
 };
 
@@ -158,6 +115,9 @@ type VariantShippingData = {
   width: number;
   height: number;
   weightLb: number | null;
+  countryOfOrigin: string | null;
+  provinceOfOrigin: string | null;
+  harmonizedCode: string | null;
 };
 
 type ShipwiseRate = {
@@ -190,7 +150,7 @@ type ShipwiseResponse = {
   success?: boolean;
   customer?: string | null;
   profileId?: string | null;
-  rates?: ShipwiseRate[] | null | any[];
+  rates?: Array<Record<string, unknown>> | null;
 };
 
 type NormalizedShipwiseRate = {
@@ -202,28 +162,298 @@ type NormalizedShipwiseRate = {
   estimatedDeliveryDays?: number | null;
 };
 
+type ShipwiseAddress = ReturnType<typeof convertAddress>;
+
+type ShipwiseItem = {
+  id: number;
+  sku: string;
+  description: string;
+  title: string;
+  quantity: number;
+  quantityToShip: number;
+  quantityOrdered: number;
+  weight: number;
+  price: number;
+  unitPrice: number;
+  unitCustoms: number;
+  length: number;
+  width: number;
+  height: number;
+  productId?: number;
+  variantId?: number;
+  countryOfOrigin: string;
+  provinceOfOrigin: string;
+  harmonizedCode: string;
+  customsDescription: string;
+  customsDeclaredValue: number;
+};
+
+type OperationalLogDetails = {
+  correlationId: string;
+  shopDomain: string | null;
+  requestSuccess: boolean;
+  responseStatus: number;
+  latencyMs: number;
+  itemCount: number;
+  ratesCount: number;
+};
+
 // ---------------------------------------------------------------------------
-// Fetch variant shipping data from Shopify Admin
+// Logging helpers
+// ---------------------------------------------------------------------------
+
+function createCorrelationId() {
+  return `shipwise-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function logOperational(
+  level: "info" | "warn" | "error",
+  message: string,
+  details: OperationalLogDetails,
+) {
+  if (level === "warn") {
+    console.warn(message, details);
+    return;
+  }
+
+  if (level === "error") {
+    console.error(message, details);
+    return;
+  }
+
+  console.log(message, details);
+}
+
+function logDebug(message: string, details: Record<string, unknown>) {
+  if (!SHIPWISE_DEBUG_VERBOSE) return;
+  console.log(message, details);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: offline token lookup for Shopify Admin
+// ---------------------------------------------------------------------------
+
+async function getOfflineShopAdminAccessToken(
+  shopDomain: string | null,
+): Promise<string | null> {
+  if (!shopDomain) return null;
+
+  const offlineSession = await prisma.session.findFirst({
+    where: {
+      shop: shopDomain,
+      isOnline: false,
+    },
+    select: {
+      accessToken: true,
+    },
+  });
+
+  return offlineSession?.accessToken ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Exact grams -> pounds fallback conversion
+// ---------------------------------------------------------------------------
+
+function gramsToPoundsExact(grams: number) {
+  if (!Number.isFinite(grams) || grams <= 0) return 0;
+  return Number((grams / 453.59237).toFixed(6));
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Convert Shopify's stored variant weight/unit into pounds
+// ---------------------------------------------------------------------------
+
+function shopifyWeightToPounds(
+  weight: number | string | null | undefined,
+  weightUnit: string | null | undefined,
+): number | null {
+  const weightNumber = typeof weight === "string" ? Number(weight) : weight;
+
+  if (
+    weightNumber == null ||
+    !Number.isFinite(weightNumber) ||
+    weightNumber <= 0
+  ) {
+    return null;
+  }
+
+  const unit = weightUnit?.toUpperCase();
+
+  switch (unit) {
+    case "POUNDS":
+    case "POUND":
+    case "LB":
+    case "LBS":
+      return Number(weightNumber.toFixed(6));
+
+    case "OUNCES":
+    case "OUNCE":
+    case "OZ":
+      return Number((weightNumber / 16).toFixed(6));
+
+    case "KILOGRAMS":
+    case "KILOGRAM":
+    case "KG":
+      return Number((weightNumber * 2.20462262185).toFixed(6));
+
+    case "GRAMS":
+    case "GRAM":
+    case "G":
+      return Number((weightNumber / 453.59237).toFixed(6));
+
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Address normalization helpers
+// ---------------------------------------------------------------------------
+
+function normalizeCountryCode(country: string | null | undefined): string {
+  if (!country) return "";
+
+  const value = country.trim();
+  if (!value) return "";
+
+  const upper = value.toUpperCase();
+
+  // Shopify normally sends ISO-2 country codes like US, CA, GB, FR.
+  if (/^[A-Z]{2}$/.test(upper)) {
+    return upper;
+  }
+
+  // Small fallback list only. Do not manually map every country.
+  const countryMap: Record<string, string> = {
+    canada: "CA",
+    "united states": "US",
+    "united states of america": "US",
+    usa: "US",
+    "united kingdom": "GB",
+    "great britain": "GB",
+    uk: "GB",
+  };
+
+  const mapped = countryMap[value.toLowerCase()];
+  if (mapped) return mapped;
+
+  console.warn("[Shipwise] Country was not a 2-letter ISO code", {
+    country,
+  });
+
+  return "";
+}
+
+function normalizeRegionCode(
+  region: string | null | undefined,
+  countryCode: string,
+): string {
+  if (!region) return "";
+
+  const value = region.trim();
+  if (!value) return "";
+
+  const lower = value.toLowerCase();
+
+  if (countryCode === "CA") {
+    const canadaMap: Record<string, string> = {
+      alberta: "AB",
+      "british columbia": "BC",
+      manitoba: "MB",
+      "new brunswick": "NB",
+      "newfoundland and labrador": "NL",
+      "northwest territories": "NT",
+      "nova scotia": "NS",
+      nunavut: "NU",
+      ontario: "ON",
+      "prince edward island": "PE",
+      quebec: "QC",
+      saskatchewan: "SK",
+      yukon: "YT",
+    };
+
+    const mapped = canadaMap[lower];
+    if (mapped) return mapped;
+  }
+
+  // Most Shopify carrier-service requests already send province/state as a code.
+  if (/^[A-Za-z0-9-]{2,3}$/.test(value)) {
+    return value.toUpperCase();
+  }
+
+  console.warn("[Shipwise] Region was not a short province/state code", {
+    countryCode,
+    region,
+  });
+
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Debug-only redacted summaries
+// ---------------------------------------------------------------------------
+
+function summarizeIncomingRequest(
+  rate: ShopifyRateRequest["rate"],
+  itemCount: number,
+) {
+  return {
+    hasOrigin: Boolean(rate?.origin),
+    hasDestination: Boolean(rate?.destination),
+    originCountry: rate?.origin?.country_code ?? rate?.origin?.country ?? null,
+    destinationCountry:
+      rate?.destination?.country_code ?? rate?.destination?.country ?? null,
+    currency: rate?.currency ?? "USD",
+    itemCount,
+  };
+}
+
+function summarizePreparedItems(
+  items: ShipwiseItem[],
+  shippingDataMap: Map<number, VariantShippingData>,
+) {
+  return items.map((item) => {
+    const variantData =
+      typeof item.variantId === "number"
+        ? shippingDataMap.get(item.variantId)
+        : undefined;
+
+    return {
+      quantity: item.quantity,
+      weightLb: Number(item.weight.toFixed(6)),
+      dimensions: `${item.length}x${item.width}x${item.height}`,
+      weightSource:
+        variantData?.weightLb != null && variantData.weightLb > 0
+          ? "variant_weight"
+          : "callback_grams_fallback",
+      hasVariantId: typeof item.variantId === "number",
+      countryOfOrigin: item.countryOfOrigin || null,
+      hasHarmonizedCode: Boolean(item.harmonizedCode),
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Fetch variant dimensions + exact variant weight from Shopify Admin
 // ---------------------------------------------------------------------------
 
 async function fetchVariantShippingData(
   variantIds: number[],
   correlationId: string,
   requestedShopDomain: string | null,
-  adminAccessToken: string | null
+  adminAccessToken: string | null,
 ): Promise<Map<number, VariantShippingData>> {
   const shippingDataMap = new Map<number, VariantShippingData>();
-
   const adminStoreDomain = requestedShopDomain;
 
   if (!adminStoreDomain || !adminAccessToken) {
-    console.warn(
-      "[Shipwise] Missing per-shop Shopify Admin API credentials - falling back to callback grams",
-      {
-        adminStoreDomain,
-        hasAdminToken: !!adminAccessToken,
-      }
-    );
+    logDebug("[Shipwise] Variant lookup skipped", {
+      correlationId,
+      shopDomain: requestedShopDomain,
+      hasAdminToken: Boolean(adminAccessToken),
+      requestedVariantCount: variantIds.length,
+    });
     return shippingDataMap;
   }
 
@@ -233,16 +463,26 @@ async function fetchVariantShippingData(
   }
 
   const variantGids = uniqueVariantIds.map(
-    (id) => `gid://shopify/ProductVariant/${id}`
+    (id) => `gid://shopify/ProductVariant/${id}`,
   );
 
   const query = `
-    query VariantShippingData($ids: [ID!]!) {
+    query GetVariantShippingData($ids: [ID!]!) {
       nodes(ids: $ids) {
         ... on ProductVariant {
+          id
           legacyResourceId
-          weight
-          weightUnit
+          inventoryItem {
+            measurement {
+              weight {
+                value
+                unit
+              }
+            }
+            countryCodeOfOrigin
+            provinceCodeOfOrigin
+            harmonizedSystemCode
+          }
           metafield_length: metafield(namespace: "${DIMENSION_METAFIELD_NAMESPACE}", key: "${DIMENSION_KEYS.length}") { value }
           metafield_width: metafield(namespace: "${DIMENSION_METAFIELD_NAMESPACE}", key: "${DIMENSION_KEYS.width}") { value }
           metafield_height: metafield(namespace: "${DIMENSION_METAFIELD_NAMESPACE}", key: "${DIMENSION_KEYS.height}") { value }
@@ -264,52 +504,105 @@ async function fetchVariantShippingData(
           query,
           variables: { ids: variantGids },
         }),
-      }
+      },
     );
 
     if (!response.ok) {
-      console.error("[Shipwise] Failed to fetch variant shipping data", {
-        status: response.status,
-        adminStoreDomain,
+      logDebug("[Shipwise] Variant lookup HTTP failure", {
+        correlationId,
+        shopDomain: requestedShopDomain,
+        requestedVariantCount: uniqueVariantIds.length,
+        responseStatus: response.status,
       });
       return shippingDataMap;
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as {
+      data?: {
+        nodes?: Array<{
+          legacyResourceId?: string;
+          inventoryItem?: {
+            measurement?: {
+              weight?: {
+                value?: number | string | null;
+                unit?: string | null;
+              } | null;
+            } | null;
+            countryCodeOfOrigin?: string | null;
+            provinceCodeOfOrigin?: string | null;
+            harmonizedSystemCode?: string | null;
+          } | null;
+          metafield_length?: { value?: string | null } | null;
+          metafield_width?: { value?: string | null } | null;
+          metafield_height?: { value?: string | null } | null;
+        } | null>;
+      };
+      errors?: unknown;
+    };
 
     if (data.errors) {
-      console.error("[Shipwise] GraphQL errors fetching variant shipping data", {
+      logDebug("[Shipwise] Variant lookup GraphQL errors", {
+        correlationId,
+        shopDomain: requestedShopDomain,
+        requestedVariantCount: uniqueVariantIds.length,
         errors: data.errors,
-        adminStoreDomain,
       });
       return shippingDataMap;
     }
 
     for (const node of data.data?.nodes ?? []) {
-      if (!node || !node.legacyResourceId) continue;
+      if (!node?.legacyResourceId) continue;
 
-      const variantId = parseInt(node.legacyResourceId, 10);
+      const variantId = Number.parseInt(node.legacyResourceId, 10);
+      if (!Number.isFinite(variantId)) continue;
 
       const length =
-        parseFloat(node.metafield_length?.value) || DEFAULT_DIMENSIONS.length;
+        Number.parseFloat(node.metafield_length?.value ?? "") ||
+        DEFAULT_DIMENSIONS.length;
       const width =
-        parseFloat(node.metafield_width?.value) || DEFAULT_DIMENSIONS.width;
+        Number.parseFloat(node.metafield_width?.value ?? "") ||
+        DEFAULT_DIMENSIONS.width;
       const height =
-        parseFloat(node.metafield_height?.value) || DEFAULT_DIMENSIONS.height;
+        Number.parseFloat(node.metafield_height?.value ?? "") ||
+        DEFAULT_DIMENSIONS.height;
 
-      const weightLb = shopifyWeightToPounds(node.weight, node.weightUnit);
+      const weightValue = node.inventoryItem?.measurement?.weight?.value;
+      const weightUnit = node.inventoryItem?.measurement?.weight?.unit;
+      const weightLb = shopifyWeightToPounds(weightValue, weightUnit);
 
-      shippingDataMap.set(variantId, { length, width, height, weightLb });
+      const countryOfOrigin = normalizeCountryCode(
+        node.inventoryItem?.countryCodeOfOrigin,
+      );
+      const provinceOfOrigin = normalizeRegionCode(
+        node.inventoryItem?.provinceCodeOfOrigin,
+        countryOfOrigin,
+      );
+      const harmonizedCode =
+        node.inventoryItem?.harmonizedSystemCode?.trim() ?? "";
+
+      shippingDataMap.set(variantId, {
+        length,
+        width,
+        height,
+        weightLb,
+        countryOfOrigin: countryOfOrigin || null,
+        provinceOfOrigin: provinceOfOrigin || null,
+        harmonizedCode: harmonizedCode || null,
+      });
     }
 
-    console.log("[Shipwise] Fetched variant shipping data", {
-      adminStoreDomain,
-      variantCount: shippingDataMap.size,
+    logDebug("[Shipwise] Variant lookup summary", {
+      correlationId,
+      shopDomain: requestedShopDomain,
+      requestedVariantCount: uniqueVariantIds.length,
+      returnedVariantCount: shippingDataMap.size,
     });
-  } catch (err) {
-    console.error("[Shipwise] Error fetching variant shipping data", {
-      err,
-      adminStoreDomain,
+  } catch (error) {
+    logDebug("[Shipwise] Variant lookup request failed", {
+      correlationId,
+      shopDomain: requestedShopDomain,
+      requestedVariantCount: uniqueVariantIds.length,
+      error: error instanceof Error ? error.name : "variant_lookup_failed",
     });
   }
 
@@ -317,25 +610,146 @@ async function fetchVariantShippingData(
 }
 
 // ---------------------------------------------------------------------------
-// Address conversion
+// Helper: Convert Shopify address to Shipwise format
 // ---------------------------------------------------------------------------
 
 function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) {
+  const countryCode = normalizeCountryCode(addr?.country_code ?? addr?.country);
+  const state = normalizeRegionCode(
+    addr?.province_code ?? addr?.province,
+    countryCode,
+  );
+
   return {
     name: addr?.name ?? fallbackName,
+    company: addr?.company ?? addr?.company_name ?? "",
     address1: addr?.address1 ?? "",
     address2: addr?.address2 ?? "",
+    address3: addr?.address3 ?? "",
     city: addr?.city ?? "",
-    state: addr?.province ?? addr?.province_code ?? "",
+    state,
     postalCode: addr?.postal_code ?? addr?.zip ?? "",
-    countryCode: addr?.country_code ?? addr?.country ?? "",
+    countryCode,
     phone: addr?.phone ?? "",
     email: addr?.email ?? "",
   };
 }
 
 // ---------------------------------------------------------------------------
-// Action handler
+// Shipwise request helpers
+// ---------------------------------------------------------------------------
+
+function createShipwisePackages(
+  isInternational: boolean,
+  correlationId: string,
+  shipwiseItems: ShipwiseItem[],
+  shipwiseOrigin: ShipwiseAddress,
+) {
+  if (!isInternational) return [];
+
+  const totalShipmentWeightLb = shipwiseItems.reduce(
+    (sum, item) => sum + item.weight * item.quantity,
+    0,
+  );
+
+  const totalShipmentValue = shipwiseItems.reduce(
+    (sum, item) => sum + item.price * item.quantity,
+    0,
+  );
+
+  const packageLength = Math.max(
+    DEFAULT_DIMENSIONS.length,
+    ...shipwiseItems.map((item) => item.length),
+  );
+
+  const packageWidth = Math.max(
+    DEFAULT_DIMENSIONS.width,
+    ...shipwiseItems.map((item) => item.width),
+  );
+
+  const packageHeight = Math.max(
+    DEFAULT_DIMENSIONS.height,
+    ...shipwiseItems.map((item) => item.height),
+  );
+
+  return [
+    {
+      packageId: correlationId,
+      weightUnit: "LB",
+      contentWeight: Number(totalShipmentWeightLb.toFixed(6)),
+      totalWeight: Number(totalShipmentWeightLb.toFixed(6)),
+      value: Number(totalShipmentValue.toFixed(2)),
+      packaging: {
+        length: packageLength,
+        width: packageWidth,
+        height: packageHeight,
+      },
+      customs: {
+        contentsDescription: "Merchandise",
+        originCountry: shipwiseOrigin.countryCode || "US",
+        signer: SHIPWISE_CUSTOMS_SIGNER,
+        customsTag: "Merchandise",
+        items: shipwiseItems.map((item) => ({
+          itemMarketProductKey:
+            item.variantId?.toString() ?? item.productId?.toString() ?? item.sku,
+          sku: item.sku,
+          productSku: item.sku,
+          description: item.customsDescription,
+          qty: item.quantity,
+          value: item.price,
+          weight: item.weight,
+          countryOfMfg: item.countryOfOrigin || shipwiseOrigin.countryCode || "US",
+          stateOrProvOfMfg: item.provinceOfOrigin,
+          harmCode: item.harmonizedCode,
+        })),
+      },
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Rate normalization helpers
+// ---------------------------------------------------------------------------
+
+function extractNumericValue(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function appendNormalizedRate(
+  allRates: NormalizedShipwiseRate[],
+  rate: ShipwiseRate | null | undefined,
+  fallbackCurrency: string,
+  fallbackServiceCode: string,
+) {
+  if (!rate || rate.value == null || rate.value <= 0) return;
+
+  const valueInDollars = SHIPWISE_RETURNS_CENTS ? rate.value / 100 : rate.value;
+
+  allRates.push({
+    serviceName:
+      rate.carrierService ?? rate.class ?? rate.carrier ?? rate.carrierCode ?? "Shipping",
+    serviceCode:
+      rate.carrierService ?? rate.carrierCode ?? rate.class ?? fallbackServiceCode,
+    value: valueInDollars,
+    currency: rate.currencyCodeIso ?? fallbackCurrency,
+    estimatedDeliveryDate:
+      rate.estimatedDeliveryDate ?? rate.transitTime?.estimatedDeliveryDate ?? null,
+    estimatedDeliveryDays:
+      rate.estimatedDeliveryDays ?? rate.transitTime?.estimatedDeliveryDays ?? null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main action – called by Shopify during checkout
 // ---------------------------------------------------------------------------
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -343,15 +757,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const startedAt = Date.now();
 
   if (request.method !== "POST") {
-    console.error("[Shipwise] Non-POST request hit /api/shipwise/rates", {
-      method: request.method,
+    logOperational("warn", "[Shipwise] Rejected non-POST request", {
+      correlationId,
+      shopDomain: null,
+      requestSuccess: false,
+      responseStatus: 405,
+      latencyMs: Date.now() - startedAt,
+      itemCount: 0,
+      ratesCount: 0,
     });
     return json({ error: "Method Not Allowed", correlationId }, { status: 405 });
   }
 
   const shopDomain =
-    request.headers.get("x-shopify-shop-domain") ||
-    request.headers.get("X-Shopify-Shop-Domain") ||
+    request.headers.get("x-shopify-shop-domain") ??
+    request.headers.get("X-Shopify-Shop-Domain") ??
     null;
 
   const config = shopDomain
@@ -361,9 +781,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shipwiseBearerToken = config?.bearerToken ?? null;
 
   if (!shipwiseBearerToken) {
-    console.error("[Shipwise] No token saved for this store", {
-      shopDomain,
+    logOperational("warn", "[Shipwise] No Shipwise token configured", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: 200,
+      latencyMs: Date.now() - startedAt,
+      itemCount: 0,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 200 });
   }
@@ -371,140 +796,197 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   let shopifyBody: ShopifyRateRequest;
   try {
     shopifyBody = (await request.json()) as ShopifyRateRequest;
-  } catch (err) {
-    console.error("[Shipwise] Failed to parse Shopify JSON payload", {
-      err,
+  } catch {
+    logOperational("warn", "[Shipwise] Invalid Shopify payload", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: 400,
+      latencyMs: Date.now() - startedAt,
+      itemCount: 0,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 400 });
   }
 
   const rate = shopifyBody.rate;
   if (!rate) {
-    console.error("[Shipwise] Missing rate object in Shopify payload", {
-      bodyKeys: Object.keys(shopifyBody || {}),
+    logOperational("warn", "[Shipwise] Missing rate object", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: 400,
+      latencyMs: Date.now() - startedAt,
+      itemCount: 0,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 400 });
   }
 
-  const origin = rate.origin;
-  const destination = rate.destination;
   const items = rate.items ?? [];
+  const shippableItems = items.filter((item) => item.requires_shipping !== false);
 
-  logInfo("[Shipwise] Received Shopify rate request", {
+  logDebug("[Shipwise] Redacted incoming request summary", {
     correlationId,
     shopDomain,
-    hasOrigin: !!origin,
-    originCountry: origin?.country_code || origin?.country,
-    hasDestination: !!destination,
-    destCountry: destination?.country_code || destination?.country,
-    itemCount: items.length,
-    currency: rate.currency,
+    ...summarizeIncomingRequest(rate, shippableItems.length),
   });
 
-  if (!items.length) {
-    console.warn("[Shipwise] No items in Shopify rate request", { correlationId });
+  if (!shippableItems.length) {
+    logOperational("info", "[Shipwise] No shippable items", {
+      correlationId,
+      shopDomain,
+      requestSuccess: true,
+      responseStatus: 200,
+      latencyMs: Date.now() - startedAt,
+      itemCount: 0,
+      ratesCount: 0,
+    });
     return json({ rates: [] }, { status: 200 });
   }
 
   const shopCurrency = rate.currency ?? "USD";
+  const shipwiseOrigin = convertAddress(rate.origin, "Origin");
+  const shipwiseDestination = convertAddress(rate.destination, "Destination");
 
-  // -------------------------------------------------------------------------
-  // Fetch exact variant shipping data from Shopify Admin
-  // -------------------------------------------------------------------------
+  const isInternational =
+    Boolean(shipwiseOrigin.countryCode) &&
+    Boolean(shipwiseDestination.countryCode) &&
+    shipwiseOrigin.countryCode !== shipwiseDestination.countryCode;
 
-  const shippableItems = items.filter((i) => i.requires_shipping !== false);
+  logDebug("[Shipwise] Normalized address summary", {
+    correlationId,
+    shopDomain,
+    isInternational,
+    origin: {
+      city: shipwiseOrigin.city,
+      state: shipwiseOrigin.state,
+      postalCode: shipwiseOrigin.postalCode,
+      countryCode: shipwiseOrigin.countryCode,
+    },
+    destination: {
+      city: shipwiseDestination.city,
+      state: shipwiseDestination.state,
+      postalCode: shipwiseDestination.postalCode,
+      countryCode: shipwiseDestination.countryCode,
+    },
+  });
 
   const variantIds = shippableItems
-    .filter((i) => i.variant_id)
-    .map((i) => i.variant_id!);
+    .filter((item) => typeof item.variant_id === "number")
+    .map((item) => item.variant_id as number);
 
-  const shopifyAdminAccessToken =
-    await getOfflineShopAdminAccessToken(shopDomain);
-
+  const shopifyAdminAccessToken = await getOfflineShopAdminAccessToken(shopDomain);
   const shippingDataMap = await fetchVariantShippingData(
     variantIds,
     correlationId,
     shopDomain,
-    shopifyAdminAccessToken
+    shopifyAdminAccessToken,
   );
 
-  // -------------------------------------------------------------------------
-  // Build Shipwise request body
-  // -------------------------------------------------------------------------
-
-  const shipwiseItems = shippableItems.map((item, index) => {
+  const shipwiseItems: ShipwiseItem[] = shippableItems.map((item, index) => {
     const quantity = item.quantity ?? 1;
     const grams = item.grams ?? 0;
-
-    const shippingData = item.variant_id
-      ? shippingDataMap.get(item.variant_id)
-      : undefined;
+    const variantData =
+      typeof item.variant_id === "number"
+        ? shippingDataMap.get(item.variant_id)
+        : undefined;
 
     const hasVariantWeight =
-      typeof shippingData?.weightLb === "number" &&
-      Number.isFinite(shippingData.weightLb) &&
-      shippingData.weightLb > 0;
+      typeof variantData?.weightLb === "number" &&
+      Number.isFinite(variantData.weightLb) &&
+      variantData.weightLb > 0;
 
     const weightPerItemLb = hasVariantWeight
-      ? shippingData!.weightLb!
+      ? (variantData?.weightLb as number)
       : gramsToPoundsExact(grams);
 
-    if (!hasVariantWeight) {
-      console.warn(
-        "[Shipwise] Using callback grams fallback instead of exact Shopify variant weight",
-        {
-          correlationId,
-          variantId: item.variant_id,
-          sku: item.sku ?? item.name ?? `item-${index + 1}`,
-          grams,
-          fallbackWeightLb: weightPerItemLb,
-        }
-      );
+    const price = Number(((item.price ?? 0) / 100).toFixed(2));
+    const sku = item.sku ?? item.name ?? `item-${index + 1}`;
+    const description = item.name ?? item.sku ?? "Item";
+
+    const countryOfOrigin =
+      variantData?.countryOfOrigin ?? shipwiseOrigin.countryCode ?? "";
+    const provinceOfOrigin = variantData?.provinceOfOrigin ?? "";
+    const harmonizedCode = variantData?.harmonizedCode ?? "";
+
+    if (isInternational && !countryOfOrigin) {
+      console.warn("[Shipwise] Missing country of origin for international item", {
+        correlationId,
+        variantId: item.variant_id,
+        sku,
+      });
     }
 
-    const length = shippingData?.length ?? DEFAULT_DIMENSIONS.length;
-    const width = shippingData?.width ?? DEFAULT_DIMENSIONS.width;
-    const height = shippingData?.height ?? DEFAULT_DIMENSIONS.height;
+    if (isInternational && !harmonizedCode) {
+      console.warn("[Shipwise] Missing HS code for international item", {
+        correlationId,
+        variantId: item.variant_id,
+        sku,
+      });
+    }
 
     return {
       id: index + 1,
-      sku: item.sku ?? item.name ?? `item-${index + 1}`,
-      description: item.name ?? item.sku ?? "Item",
+      sku,
+      description,
+      title: description,
       quantity,
+      quantityToShip: quantity,
+      quantityOrdered: quantity,
       weight: weightPerItemLb,
-      price: (item.price ?? 0) / 100,
-      length,
-      width,
-      height,
+      price,
+      unitPrice: price,
+      unitCustoms: price,
+      length: variantData?.length ?? DEFAULT_DIMENSIONS.length,
+      width: variantData?.width ?? DEFAULT_DIMENSIONS.width,
+      height: variantData?.height ?? DEFAULT_DIMENSIONS.height,
       productId: item.product_id,
       variantId: item.variant_id,
+      countryOfOrigin,
+      provinceOfOrigin,
+      harmonizedCode,
+      customsDescription: description,
+      customsDeclaredValue: price,
     };
   });
 
-  const shipwiseOrigin = convertAddress(origin, "Origin");
-  const shipwiseDestination = convertAddress(destination, "Destination");
+  logDebug("[Shipwise] Prepared redacted request summary", {
+    correlationId,
+    shopDomain,
+    isInternational,
+    itemCount: shipwiseItems.length,
+    items: summarizePreparedItems(shipwiseItems, shippingDataMap),
+  });
+
+  const shipwisePackages = createShipwisePackages(
+    isInternational,
+    correlationId,
+    shipwiseItems,
+    shipwiseOrigin,
+  );
 
   const shipwiseRequestBody = {
     items: shipwiseItems,
+
+    // Keep the old field names because domestic US rating is already working.
     origin: shipwiseOrigin,
     destination: shipwiseDestination,
+
+    // Also send Shipwise's documented field names for international rating.
+    ...(isInternational
+      ? {
+          from: shipwiseOrigin,
+          to: shipwiseDestination,
+          packages: shipwisePackages,
+        }
+      : {}),
+
+    ...(SHIPWISE_SHIP_METHOD ? { shipMethod: SHIPWISE_SHIP_METHOD } : {}),
     currency: shopCurrency,
   };
 
   const shipwiseUrl = `${SHIPWISE_API_URL.replace(/\/$/, "")}/api/shipping-rates`;
-
-  logDebug("[Shipwise] Prepared request summary", {
-    correlationId,
-    shopDomain,
-    url: shipwiseUrl,
-    itemCount: shipwiseItems.length,
-  });
-
-  // -------------------------------------------------------------------------
-  // Call Shipwise API
-  // -------------------------------------------------------------------------
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 8000);
@@ -521,38 +1003,54 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       body: JSON.stringify(shipwiseRequestBody),
       signal: controller.signal,
     });
-  } catch (err) {
+  } catch (error) {
     clearTimeout(timeoutId);
-    console.error("[Shipwise] Network error calling Shipwise API", {
-      err,
+    logOperational("error", "[Shipwise] Shipwise request failed", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: 502,
+      latencyMs: Date.now() - startedAt,
+      itemCount: shippableItems.length,
+      ratesCount: 0,
+    });
+    logDebug("[Shipwise] Request failure summary", {
+      correlationId,
+      shopDomain,
+      error: error instanceof Error ? error.name : "shipwise_request_failed",
     });
     return json({ rates: [] }, { status: 502 });
   }
   clearTimeout(timeoutId);
 
-  let shipwiseJson: ShipwiseResponse = {};
+  let shipwiseJson: ShipwiseResponse;
   try {
     shipwiseJson = (await shipwiseRes.json()) as ShipwiseResponse;
-  } catch (err) {
-    console.error("[Shipwise] Failed to parse Shipwise JSON response", {
-      status: shipwiseRes.status,
-      err,
+  } catch {
+    logOperational("error", "[Shipwise] Invalid Shipwise JSON response", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: shipwiseRes.status,
+      latencyMs: Date.now() - startedAt,
+      itemCount: shippableItems.length,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 502 });
   }
 
-  logInfo("[Shipwise] Received response from Shipwise", {
+  logDebug("[Shipwise] Shipwise response summary", {
     correlationId,
-    status: shipwiseRes.status,
-    wasSuccessful: shipwiseJson.wasSuccessful,
-    success: shipwiseJson.success,
-    responseMsg: shipwiseJson.responseMsg,
-    shipmentItems: shipwiseJson.shipmentItems?.length ?? 0,
-    externalServices: shipwiseJson.externalServices?.length ?? 0,
-    topLevelRates: Array.isArray(shipwiseJson.rates) ? shipwiseJson.rates.length : 0,
-    rateErrors: shipwiseJson.rateErrors,
+    shopDomain,
+    responseStatus: shipwiseRes.status,
+    wasSuccessful: shipwiseJson.wasSuccessful ?? null,
+    success: shipwiseJson.success ?? null,
+    shipmentItemsCount: shipwiseJson.shipmentItems?.length ?? 0,
+    externalServicesCount: shipwiseJson.externalServices?.length ?? 0,
+    topLevelRatesCount: Array.isArray(shipwiseJson.rates)
+      ? shipwiseJson.rates.length
+      : 0,
+    rateErrorsCount: shipwiseJson.rateErrors?.length ?? 0,
   });
 
   if (
@@ -560,84 +1058,38 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     shipwiseJson.wasSuccessful === false ||
     shipwiseJson.success === false
   ) {
-    console.error("[Shipwise] Shipwise API responded with error", {
-      status: shipwiseRes.status,
+    logOperational("error", "[Shipwise] Shipwise returned error status", {
       correlationId,
+      shopDomain,
+      requestSuccess: false,
+      responseStatus: shipwiseRes.status,
+      latencyMs: Date.now() - startedAt,
+      itemCount: shippableItems.length,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 502 });
   }
 
-  // -------------------------------------------------------------------------
-  // Normalize and collect all rates
-  // -------------------------------------------------------------------------
-
   const allRates: NormalizedShipwiseRate[] = [];
 
-  for (const item of shipwiseJson.shipmentItems ?? []) {
-    const candidateRates: ShipwiseRate[] = [];
-    if (item.selectedRate) candidateRates.push(item.selectedRate);
-    if (Array.isArray(item.rates)) candidateRates.push(...item.rates);
+  for (const shipmentItem of shipwiseJson.shipmentItems ?? []) {
+    appendNormalizedRate(allRates, shipmentItem.selectedRate, shopCurrency, "standard");
 
-    for (const r of candidateRates) {
-      if (!r || r.value == null || r.value <= 0) continue;
-
-      const valueInDollars = SHIPWISE_RETURNS_CENTS ? r.value / 100 : r.value;
-
-      allRates.push({
-        serviceName:
-          r.carrierService ?? r.class ?? r.carrier ?? r.carrierCode ?? "Shipping",
-        serviceCode: r.carrierService ?? r.carrierCode ?? r.class ?? "standard",
-        value: valueInDollars,
-        currency: r.currencyCodeIso ?? shopCurrency,
-        estimatedDeliveryDate:
-          r.estimatedDeliveryDate ?? r.transitTime?.estimatedDeliveryDate ?? null,
-        estimatedDeliveryDays:
-          r.estimatedDeliveryDays ?? r.transitTime?.estimatedDeliveryDays ?? null,
-      });
+    for (const shipmentRate of shipmentItem.rates ?? []) {
+      appendNormalizedRate(allRates, shipmentRate, shopCurrency, "standard");
     }
   }
 
-  for (const r of shipwiseJson.externalServices ?? []) {
-    if (!r || r.value == null || r.value <= 0) continue;
-
-    const valueInDollars = SHIPWISE_RETURNS_CENTS ? r.value / 100 : r.value;
-
-    allRates.push({
-      serviceName:
-        r.carrierService ?? r.class ?? r.carrier ?? r.carrierCode ?? "Shipping",
-      serviceCode: r.carrierService ?? r.carrierCode ?? r.class ?? "external",
-      value: valueInDollars,
-      currency: r.currencyCodeIso ?? shopCurrency,
-      estimatedDeliveryDate:
-        r.estimatedDeliveryDate ?? r.transitTime?.estimatedDeliveryDate ?? null,
-      estimatedDeliveryDays:
-        r.estimatedDeliveryDays ?? r.transitTime?.estimatedDeliveryDays ?? null,
-    });
+  for (const externalRate of shipwiseJson.externalServices ?? []) {
+    appendNormalizedRate(allRates, externalRate, shopCurrency, "external");
   }
 
-  // Handle top-level rates (newer Shipwise response shape)
-  const topLevelRates = shipwiseJson.rates;
-  if (Array.isArray(topLevelRates)) {
-    for (const raw of topLevelRates) {
-      if (!raw) continue;
-
-      const rawValue =
-        (raw as any).value ??
-        (raw as any).total ??
-        (raw as any).amount ??
-        (raw as any).price ??
-        (raw as any).rate ??
-        null;
-
-      let numericValue: number | null = null;
-      if (typeof rawValue === "number") {
-        numericValue = rawValue;
-      } else if (typeof rawValue === "string") {
-        const parsed = Number(rawValue);
-        if (!Number.isNaN(parsed)) {
-          numericValue = parsed;
-        }
-      }
+  if (Array.isArray(shipwiseJson.rates)) {
+    for (const rawRate of shipwiseJson.rates) {
+      const record = rawRate as Record<string, unknown>;
+      const numericValue = extractNumericValue(
+        record.value ?? record.total ?? record.amount ?? record.price ?? record.rate,
+      );
 
       if (numericValue == null || numericValue <= 0) continue;
 
@@ -646,37 +1098,45 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         : numericValue;
 
       const currency =
-        (raw as any).currencyCodeIso ??
-        (raw as any).currency ??
-        (raw as any).currency_code ??
+        (record.currencyCodeIso as string | undefined) ??
+        (record.currency as string | undefined) ??
+        (record.currency_code as string | undefined) ??
         shopCurrency;
 
       const serviceName =
-        (raw as any).serviceName ??
-        (raw as any).service ??
-        (raw as any).carrierService ??
-        (raw as any).class ??
-        (raw as any).carrier ??
-        (raw as any).carrierCode ??
+        (record.serviceName as string | undefined) ??
+        (record.service as string | undefined) ??
+        (record.carrierService as string | undefined) ??
+        (record.class as string | undefined) ??
+        (record.carrier as string | undefined) ??
+        (record.carrierCode as string | undefined) ??
         "Shipping";
 
       const serviceCode =
-        (raw as any).serviceCode ??
-        (raw as any).carrierService ??
-        (raw as any).carrierCode ??
-        (raw as any).class ??
+        (record.serviceCode as string | undefined) ??
+        (record.carrierService as string | undefined) ??
+        (record.carrierCode as string | undefined) ??
+        (record.class as string | undefined) ??
         "standard";
 
       const estimatedDeliveryDays =
-        (raw as any).estimatedDeliveryDays ??
-        (raw as any).transitDays ??
-        (raw as any).transit_time ??
-        (raw as any).transitTime?.estimatedDeliveryDays ??
+        (record.estimatedDeliveryDays as number | null | undefined) ??
+        (record.transitDays as number | null | undefined) ??
+        (record.transit_time as number | null | undefined) ??
+        (
+          record.transitTime as
+            | { estimatedDeliveryDays?: number | null }
+            | undefined
+        )?.estimatedDeliveryDays ??
         null;
 
       const estimatedDeliveryDate =
-        (raw as any).estimatedDeliveryDate ??
-        (raw as any).transitTime?.estimatedDeliveryDate ??
+        (record.estimatedDeliveryDate as string | null | undefined) ??
+        (
+          record.transitTime as
+            | { estimatedDeliveryDate?: string | null }
+            | undefined
+        )?.estimatedDeliveryDate ??
         null;
 
       allRates.push({
@@ -691,26 +1151,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (!allRates.length) {
-    logInfo("[Shipwise] No usable rates returned", {
+    logOperational("info", "[Shipwise] No usable rates returned", {
       correlationId,
       shopDomain,
-      status: shipwiseRes.status,
+      requestSuccess: true,
+      responseStatus: 200,
       latencyMs: Date.now() - startedAt,
+      itemCount: shippableItems.length,
+      ratesCount: 0,
     });
     return json({ rates: [] }, { status: 200 });
   }
 
-  // -------------------------------------------------------------------------
-  // Find the LOWEST rate
-  // -------------------------------------------------------------------------
-
-  const lowestRate = allRates.reduce((min, r) => (r.value < min.value ? r : min));
+  const lowestRate = allRates.reduce((min, current) =>
+    current.value < min.value ? current : min,
+  );
 
   const totalPriceCents = Math.round(lowestRate.value * 100);
 
   const shopifyRate = {
     service_name: lowestRate.serviceName,
     service_code: lowestRate.serviceCode,
+    description:
+      lowestRate.estimatedDeliveryDays != null
+        ? `Estimated delivery in ${lowestRate.estimatedDeliveryDays} business days`
+        : "Live shipping rate calculated by 33 Degrees",
     total_price: totalPriceCents.toString(),
     currency: lowestRate.currency ?? shopCurrency,
     ...(lowestRate.estimatedDeliveryDate
@@ -721,23 +1186,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       : {}),
   };
 
-  logInfo("[Shipwise] Returning LOWEST rate to Shopify", {
+  logOperational("info", "[Shipwise] Returning rate to Shopify", {
     correlationId,
     shopDomain,
-    selectedRate: {
-      service: shopifyRate.service_name,
-      code: shopifyRate.service_code,
-      priceCents: shopifyRate.total_price,
-      currency: shopifyRate.currency,
-    },
-    allRatesCount: allRates.length,
+    requestSuccess: true,
+    responseStatus: 200,
     latencyMs: Date.now() - startedAt,
+    itemCount: shippableItems.length,
+    ratesCount: allRates.length,
   });
 
-  return json(
-    {
-      rates: [shopifyRate],
-    },
-    { status: 200 }
-  );
+  return json({ rates: [shopifyRate] }, { status: 200 });
 };

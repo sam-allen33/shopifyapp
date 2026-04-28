@@ -3,7 +3,7 @@ import prisma from "../db.server";
 import { apiVersion } from "../shopify.server";
 
 // ---------------------------------------------------------------------------
-// Tiny local json() helper (since react-router doesn't export one here)
+// Tiny local json() helper
 // ---------------------------------------------------------------------------
 
 function json(data: unknown, init?: number | ResponseInit): Response {
@@ -42,6 +42,9 @@ const SHIPWISE_SHIP_METHOD = process.env.SHIPWISE_SHIP_METHOD ?? "";
 const SHIPWISE_CUSTOMS_SIGNER =
   process.env.SHIPWISE_CUSTOMS_SIGNER ?? "33 Degrees";
 
+const SHIPWISE_DEFAULT_HS_CODE =
+  process.env.SHIPWISE_DEFAULT_HS_CODE ?? "";
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ const DIMENSION_KEYS = {
   height: "height",
 };
 
-// Default dimensions if metafields are not set (fallback), in inches.
+// Default dimensions if metafields are not set, in inches.
 const DEFAULT_DIMENSIONS = {
   length: 10,
   width: 8,
@@ -91,7 +94,7 @@ type ShopifyCartItem = {
   sku?: string;
   quantity?: number;
   grams?: number;
-  price?: number; // cents
+  price?: number;
   requires_shipping?: boolean;
   product_id?: number;
   variant_id?: number;
@@ -118,6 +121,45 @@ type VariantShippingData = {
   countryOfOrigin: string | null;
   provinceOfOrigin: string | null;
   harmonizedCode: string | null;
+  countrySpecificHarmonizedCodes: Record<string, string>;
+};
+
+type ShipwiseAddress = {
+  name: string;
+  company: string;
+  address1: string;
+  address2: string;
+  address3: string;
+  city: string;
+  state: string;
+  postalCode: string;
+  countryCode: string;
+  phone: string;
+  email: string;
+};
+
+type ShipwiseItem = {
+  id: number;
+  sku: string;
+  description: string;
+  title: string;
+  quantity: number;
+  quantityToShip: number;
+  quantityOrdered: number;
+  weight: number;
+  price: number;
+  unitPrice: number;
+  unitCustoms: number;
+  length: number;
+  width: number;
+  height: number;
+  productId?: number;
+  variantId?: number;
+  countryOfOrigin: string;
+  provinceOfOrigin: string;
+  harmonizedCode: string;
+  customsDescription: string;
+  customsDeclaredValue: number;
 };
 
 type ShipwiseRate = {
@@ -162,32 +204,6 @@ type NormalizedShipwiseRate = {
   estimatedDeliveryDays?: number | null;
 };
 
-type ShipwiseAddress = ReturnType<typeof convertAddress>;
-
-type ShipwiseItem = {
-  id: number;
-  sku: string;
-  description: string;
-  title: string;
-  quantity: number;
-  quantityToShip: number;
-  quantityOrdered: number;
-  weight: number;
-  price: number;
-  unitPrice: number;
-  unitCustoms: number;
-  length: number;
-  width: number;
-  height: number;
-  productId?: number;
-  variantId?: number;
-  countryOfOrigin: string;
-  provinceOfOrigin: string;
-  harmonizedCode: string;
-  customsDescription: string;
-  customsDeclaredValue: number;
-};
-
 type OperationalLogDetails = {
   correlationId: string;
   shopDomain: string | null;
@@ -230,7 +246,7 @@ function logDebug(message: string, details: Record<string, unknown>) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: offline token lookup for Shopify Admin
+// Shopify token helper
 // ---------------------------------------------------------------------------
 
 async function getOfflineShopAdminAccessToken(
@@ -252,17 +268,13 @@ async function getOfflineShopAdminAccessToken(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Exact grams -> pounds fallback conversion
+// Weight helpers
 // ---------------------------------------------------------------------------
 
 function gramsToPoundsExact(grams: number) {
   if (!Number.isFinite(grams) || grams <= 0) return 0;
   return Number((grams / 453.59237).toFixed(6));
 }
-
-// ---------------------------------------------------------------------------
-// Helper: Convert Shopify's stored variant weight/unit into pounds
-// ---------------------------------------------------------------------------
 
 function shopifyWeightToPounds(
   weight: number | string | null | undefined,
@@ -308,7 +320,7 @@ function shopifyWeightToPounds(
 }
 
 // ---------------------------------------------------------------------------
-// Address normalization helpers
+// Country, region, and HS-code normalization helpers
 // ---------------------------------------------------------------------------
 
 function normalizeCountryCode(country: string | null | undefined): string {
@@ -390,8 +402,26 @@ function normalizeRegionCode(
   return "";
 }
 
+function normalizeHarmonizedCode(code: string | null | undefined): string {
+  if (!code) return "";
+
+  const value = code.trim().replace(/[.\s-]/g, "");
+
+  if (!value) return "";
+
+  if (/^\d{6,13}$/.test(value)) {
+    return value;
+  }
+
+  console.warn("[Shipwise] Invalid HS code format", {
+    code,
+  });
+
+  return "";
+}
+
 // ---------------------------------------------------------------------------
-// Debug-only redacted summaries
+// Debug summary helpers
 // ---------------------------------------------------------------------------
 
 function summarizeIncomingRequest(
@@ -435,7 +465,7 @@ function summarizePreparedItems(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Fetch variant dimensions + exact variant weight from Shopify Admin
+// Fetch variant dimensions, weight, origin, and HS code from Shopify Admin
 // ---------------------------------------------------------------------------
 
 async function fetchVariantShippingData(
@@ -482,6 +512,12 @@ async function fetchVariantShippingData(
             countryCodeOfOrigin
             provinceCodeOfOrigin
             harmonizedSystemCode
+            countryHarmonizedSystemCodes(first: 20) {
+              nodes {
+                countryCode
+                harmonizedSystemCode
+              }
+            }
           }
           metafield_length: metafield(namespace: "${DIMENSION_METAFIELD_NAMESPACE}", key: "${DIMENSION_KEYS.length}") { value }
           metafield_width: metafield(namespace: "${DIMENSION_METAFIELD_NAMESPACE}", key: "${DIMENSION_KEYS.width}") { value }
@@ -531,6 +567,12 @@ async function fetchVariantShippingData(
             countryCodeOfOrigin?: string | null;
             provinceCodeOfOrigin?: string | null;
             harmonizedSystemCode?: string | null;
+            countryHarmonizedSystemCodes?: {
+              nodes?: Array<{
+                countryCode?: string | null;
+                harmonizedSystemCode?: string | null;
+              } | null>;
+            } | null;
           } | null;
           metafield_length?: { value?: string | null } | null;
           metafield_width?: { value?: string | null } | null;
@@ -573,12 +615,29 @@ async function fetchVariantShippingData(
       const countryOfOrigin = normalizeCountryCode(
         node.inventoryItem?.countryCodeOfOrigin,
       );
+
       const provinceOfOrigin = normalizeRegionCode(
         node.inventoryItem?.provinceCodeOfOrigin,
         countryOfOrigin,
       );
-      const harmonizedCode =
-        node.inventoryItem?.harmonizedSystemCode?.trim() ?? "";
+
+      const harmonizedCode = normalizeHarmonizedCode(
+        node.inventoryItem?.harmonizedSystemCode,
+      );
+
+      const countrySpecificHarmonizedCodes: Record<string, string> = {};
+
+      for (const countryCodeNode of
+        node.inventoryItem?.countryHarmonizedSystemCodes?.nodes ?? []) {
+        const countryCode = normalizeCountryCode(countryCodeNode?.countryCode);
+        const countryHsCode = normalizeHarmonizedCode(
+          countryCodeNode?.harmonizedSystemCode,
+        );
+
+        if (countryCode && countryHsCode) {
+          countrySpecificHarmonizedCodes[countryCode] = countryHsCode;
+        }
+      }
 
       shippingDataMap.set(variantId, {
         length,
@@ -588,6 +647,7 @@ async function fetchVariantShippingData(
         countryOfOrigin: countryOfOrigin || null,
         provinceOfOrigin: provinceOfOrigin || null,
         harmonizedCode: harmonizedCode || null,
+        countrySpecificHarmonizedCodes,
       });
     }
 
@@ -610,10 +670,13 @@ async function fetchVariantShippingData(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Convert Shopify address to Shipwise format
+// Convert Shopify address to Shipwise address format
 // ---------------------------------------------------------------------------
 
-function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) {
+function convertAddress(
+  addr: ShopifyAddress | undefined,
+  fallbackName: string,
+): ShipwiseAddress {
   const countryCode = normalizeCountryCode(addr?.country_code ?? addr?.country);
   const state = normalizeRegionCode(
     addr?.province_code ?? addr?.province,
@@ -636,7 +699,7 @@ function convertAddress(addr: ShopifyAddress | undefined, fallbackName: string) 
 }
 
 // ---------------------------------------------------------------------------
-// Shipwise request helpers
+// Shipwise package/customs helper
 // ---------------------------------------------------------------------------
 
 function createShipwisePackages(
@@ -691,14 +754,17 @@ function createShipwisePackages(
         customsTag: "Merchandise",
         items: shipwiseItems.map((item) => ({
           itemMarketProductKey:
-            item.variantId?.toString() ?? item.productId?.toString() ?? item.sku,
+            item.variantId?.toString() ??
+            item.productId?.toString() ??
+            item.sku,
           sku: item.sku,
           productSku: item.sku,
           description: item.customsDescription,
           qty: item.quantity,
           value: item.price,
           weight: item.weight,
-          countryOfMfg: item.countryOfOrigin || shipwiseOrigin.countryCode || "US",
+          countryOfMfg:
+            item.countryOfOrigin || shipwiseOrigin.countryCode || "US",
           stateOrProvOfMfg: item.provinceOfOrigin,
           harmCode: item.harmonizedCode,
         })),
@@ -736,20 +802,31 @@ function appendNormalizedRate(
 
   allRates.push({
     serviceName:
-      rate.carrierService ?? rate.class ?? rate.carrier ?? rate.carrierCode ?? "Shipping",
+      rate.carrierService ??
+      rate.class ??
+      rate.carrier ??
+      rate.carrierCode ??
+      "Shipping",
     serviceCode:
-      rate.carrierService ?? rate.carrierCode ?? rate.class ?? fallbackServiceCode,
+      rate.carrierService ??
+      rate.carrierCode ??
+      rate.class ??
+      fallbackServiceCode,
     value: valueInDollars,
     currency: rate.currencyCodeIso ?? fallbackCurrency,
     estimatedDeliveryDate:
-      rate.estimatedDeliveryDate ?? rate.transitTime?.estimatedDeliveryDate ?? null,
+      rate.estimatedDeliveryDate ??
+      rate.transitTime?.estimatedDeliveryDate ??
+      null,
     estimatedDeliveryDays:
-      rate.estimatedDeliveryDays ?? rate.transitTime?.estimatedDeliveryDays ?? null,
+      rate.estimatedDeliveryDays ??
+      rate.transitTime?.estimatedDeliveryDays ??
+      null,
   });
 }
 
 // ---------------------------------------------------------------------------
-// Main action – called by Shopify during checkout
+// Main action: called by Shopify during checkout
 // ---------------------------------------------------------------------------
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -766,6 +843,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: 0,
       ratesCount: 0,
     });
+
     return json({ error: "Method Not Allowed", correlationId }, { status: 405 });
   }
 
@@ -790,10 +868,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: 0,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 200 });
   }
 
   let shopifyBody: ShopifyRateRequest;
+
   try {
     shopifyBody = (await request.json()) as ShopifyRateRequest;
   } catch {
@@ -806,10 +886,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: 0,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 400 });
   }
 
   const rate = shopifyBody.rate;
+
   if (!rate) {
     logOperational("warn", "[Shipwise] Missing rate object", {
       correlationId,
@@ -820,11 +902,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: 0,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 400 });
   }
 
   const items = rate.items ?? [];
-  const shippableItems = items.filter((item) => item.requires_shipping !== false);
+  const shippableItems = items.filter(
+    (item) => item.requires_shipping !== false,
+  );
 
   logDebug("[Shipwise] Redacted incoming request summary", {
     correlationId,
@@ -842,6 +927,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: 0,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 200 });
   }
 
@@ -876,7 +962,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     .filter((item) => typeof item.variant_id === "number")
     .map((item) => item.variant_id as number);
 
-  const shopifyAdminAccessToken = await getOfflineShopAdminAccessToken(shopDomain);
+  const shopifyAdminAccessToken =
+    await getOfflineShopAdminAccessToken(shopDomain);
+
   const shippingDataMap = await fetchVariantShippingData(
     variantIds,
     correlationId,
@@ -887,6 +975,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shipwiseItems: ShipwiseItem[] = shippableItems.map((item, index) => {
     const quantity = item.quantity ?? 1;
     const grams = item.grams ?? 0;
+
     const variantData =
       typeof item.variant_id === "number"
         ? shippingDataMap.get(item.variant_id)
@@ -904,11 +993,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const price = Number(((item.price ?? 0) / 100).toFixed(2));
     const sku = item.sku ?? item.name ?? `item-${index + 1}`;
     const description = item.name ?? item.sku ?? "Item";
+    const destinationCountryCode = shipwiseDestination.countryCode;
 
     const countryOfOrigin =
       variantData?.countryOfOrigin ?? shipwiseOrigin.countryCode ?? "";
+
     const provinceOfOrigin = variantData?.provinceOfOrigin ?? "";
-    const harmonizedCode = variantData?.harmonizedCode ?? "";
+
+    const harmonizedCode =
+      normalizeHarmonizedCode(
+        destinationCountryCode
+          ? variantData?.countrySpecificHarmonizedCodes?.[
+              destinationCountryCode
+            ]
+          : undefined,
+      ) ||
+      normalizeHarmonizedCode(variantData?.harmonizedCode) ||
+      normalizeHarmonizedCode(SHIPWISE_DEFAULT_HS_CODE);
 
     if (isInternational && !countryOfOrigin) {
       console.warn("[Shipwise] Missing country of origin for international item", {
@@ -983,6 +1084,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       : {}),
 
     ...(SHIPWISE_SHIP_METHOD ? { shipMethod: SHIPWISE_SHIP_METHOD } : {}),
+
     currency: shopCurrency,
   };
 
@@ -992,6 +1094,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const timeoutId = setTimeout(() => controller.abort(), 8000);
 
   let shipwiseRes: Response;
+
   try {
     shipwiseRes = await fetch(shipwiseUrl, {
       method: "POST",
@@ -1005,6 +1108,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   } catch (error) {
     clearTimeout(timeoutId);
+
     logOperational("error", "[Shipwise] Shipwise request failed", {
       correlationId,
       shopDomain,
@@ -1014,16 +1118,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: shippableItems.length,
       ratesCount: 0,
     });
+
     logDebug("[Shipwise] Request failure summary", {
       correlationId,
       shopDomain,
       error: error instanceof Error ? error.name : "shipwise_request_failed",
     });
+
     return json({ rates: [] }, { status: 502 });
   }
+
   clearTimeout(timeoutId);
 
   let shipwiseJson: ShipwiseResponse;
+
   try {
     shipwiseJson = (await shipwiseRes.json()) as ShipwiseResponse;
   } catch {
@@ -1036,6 +1144,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: shippableItems.length,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 502 });
   }
 
@@ -1051,6 +1160,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ? shipwiseJson.rates.length
       : 0,
     rateErrorsCount: shipwiseJson.rateErrors?.length ?? 0,
+    responseMsg: shipwiseJson.responseMsg ?? null,
   });
 
   if (
@@ -1067,16 +1177,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: shippableItems.length,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 502 });
   }
 
   const allRates: NormalizedShipwiseRate[] = [];
 
   for (const shipmentItem of shipwiseJson.shipmentItems ?? []) {
-    appendNormalizedRate(allRates, shipmentItem.selectedRate, shopCurrency, "standard");
+    appendNormalizedRate(
+      allRates,
+      shipmentItem.selectedRate,
+      shopCurrency,
+      "standard",
+    );
 
     for (const shipmentRate of shipmentItem.rates ?? []) {
-      appendNormalizedRate(allRates, shipmentRate, shopCurrency, "standard");
+      appendNormalizedRate(
+        allRates,
+        shipmentRate,
+        shopCurrency,
+        "standard",
+      );
     }
   }
 
@@ -1087,8 +1208,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (Array.isArray(shipwiseJson.rates)) {
     for (const rawRate of shipwiseJson.rates) {
       const record = rawRate as Record<string, unknown>;
+
       const numericValue = extractNumericValue(
-        record.value ?? record.total ?? record.amount ?? record.price ?? record.rate,
+        record.value ??
+          record.total ??
+          record.amount ??
+          record.price ??
+          record.rate,
       );
 
       if (numericValue == null || numericValue <= 0) continue;
@@ -1160,6 +1286,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       itemCount: shippableItems.length,
       ratesCount: 0,
     });
+
     return json({ rates: [] }, { status: 200 });
   }
 

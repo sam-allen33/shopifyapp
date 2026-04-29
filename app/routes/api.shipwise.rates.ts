@@ -58,11 +58,11 @@ const DIMENSION_KEYS = {
   height: "height",
 };
 
-// Default dimensions if metafields are not set, in inches (1 cubic foot).
+// Default dimensions if metafields are not set, in inches.
 const DEFAULT_DIMENSIONS = {
   length: 12,
-  width: 12,
-  height: 12,
+  width: 11,
+  height: 11,
 };
 
 // ---------------------------------------------------------------------------

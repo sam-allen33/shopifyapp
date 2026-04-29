@@ -1321,27 +1321,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ rates: [] }, { status: 200 });
   }
 
-  // CHANGE 7: Return ALL rates, not just the cheapest.
-  const shopifyRates = allRates.map((normalizedRate) => {
-    const totalPriceCents = Math.round(normalizedRate.value * 100);
+  const lowestRate = allRates.reduce((min, r) => (r.value < min.value ? r : min));
+  const totalPriceCents = Math.round(lowestRate.value * 100);
 
-    return {
-      service_name: normalizedRate.serviceName,
-      service_code: normalizedRate.serviceCode,
-      description:
-        normalizedRate.estimatedDeliveryDays != null
-          ? `Estimated delivery in ${normalizedRate.estimatedDeliveryDays} business days`
-          : "Live shipping rate calculated by 33 Degrees",
-      total_price: totalPriceCents.toString(),
-      currency: normalizedRate.currency ?? shopCurrency,
-      ...(normalizedRate.estimatedDeliveryDate
-        ? {
-            min_delivery_date: normalizedRate.estimatedDeliveryDate,
-            max_delivery_date: normalizedRate.estimatedDeliveryDate,
-          }
-        : {}),
-    };
-  });
+  const shopifyRate = {
+    service_name: "Shipping",
+    service_code: "shipping",
+    description: "",
+    total_price: totalPriceCents.toString(),
+    currency: lowestRate.currency ?? shopCurrency,
+  };
 
   logOperational("info", "[Shipwise] Returning rates to Shopify", {
     correlationId,
@@ -1350,8 +1339,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     responseStatus: 200,
     latencyMs: Date.now() - startedAt,
     itemCount: shippableItems.length,
-    ratesCount: shopifyRates.length,
+    ratesCount: 1,
   });
 
-  return json({ rates: shopifyRates }, { status: 200 });
+  return json({ rates: [shopifyRate] }, { status: 200 });
 };

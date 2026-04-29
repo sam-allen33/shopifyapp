@@ -58,11 +58,11 @@ const DIMENSION_KEYS = {
   height: "height",
 };
 
-// Default dimensions if metafields are not set, in inches.
+// Default dimensions if metafields are not set, in inches (1 cubic foot).
 const DEFAULT_DIMENSIONS = {
-  length: 10,
-  width: 8,
-  height: 4,
+  length: 12,
+  width: 12,
+  height: 12,
 };
 
 // ---------------------------------------------------------------------------
@@ -1094,20 +1094,35 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     items: summarizePreparedItems(shipwiseItems, shippingDataMap),
   });
 
+  const consolidatedWeightLb = shipwiseItems.reduce(
+    (sum, item) => sum + item.weightLb * item.quantityToShip,
+    0,
+  );
+  const consolidatedLength = Math.max(...shipwiseItems.map((i) => i.length));
+  const consolidatedWidth = Math.max(...shipwiseItems.map((i) => i.width));
+  const consolidatedHeight = Math.max(...shipwiseItems.map((i) => i.height));
+  const consolidatedValue = shipwiseItems.reduce(
+    (sum, item) => sum + item.unitPrice * item.quantityToShip,
+    0,
+  );
+  const primaryItem = shipwiseItems[0];
+
   const shipwiseRequestBody = {
-    items: shipwiseItems.map((item) => ({
-      sku: item.sku,
-      description: item.customsDescription,
-      quantity: item.quantityToShip,
-      weight: item.weightLb,
-      length: item.length,
-      width: item.width,
-      height: item.height,
-      value: item.unitPrice,
-      countryOfOrigin: item.countryOfOrigin,
-      harmonizedCode: item.harmonizedCode,
-      customsDescription: item.customsDescription,
-    })),
+    items: [
+      {
+        sku: primaryItem.sku,
+        description: primaryItem.customsDescription,
+        quantity: 1,
+        weight: consolidatedWeightLb,
+        length: consolidatedLength,
+        width: consolidatedWidth,
+        height: consolidatedHeight,
+        value: consolidatedValue,
+        countryOfOrigin: primaryItem.countryOfOrigin,
+        harmonizedCode: primaryItem.harmonizedCode,
+        customsDescription: primaryItem.customsDescription,
+      },
+    ],
     destination: {
       name: shipwiseDestination.name,
       company: shipwiseDestination.company,

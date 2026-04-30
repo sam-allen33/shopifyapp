@@ -61,7 +61,7 @@ const DIMENSION_KEYS = {
 // Default dimensions if metafields are not set, in inches.
 const DEFAULT_DIMENSIONS = {
   length: 12,
-  width: 11,
+  width: 12,
   height: 11,
 };
 

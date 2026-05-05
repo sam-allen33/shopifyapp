@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { useLoaderData, useActionData, Form } from "react-router";
+import { useLoaderData, useActionData, Form, Link } from "react-router";
 
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
@@ -134,14 +134,14 @@ export default function IndexPage() {
       <s-section heading="Step 2: Add your API token">
         {hasToken ? (
           <s-banner tone="success">
-            API token is saved. <a href="/app/shipwise-settings">Update token</a>
+            API token is saved. <Link to="/app/shipwise-settings">Update token</Link>
           </s-banner>
         ) : (
           <>
             <s-paragraph>Paste your 33 Degrees API token on the Settings page to connect your account.</s-paragraph>
-            <a href="/app/shipwise-settings">
+            <Link to="/app/shipwise-settings">
               <button type="button" style={{ padding: "8px 16px", fontSize: 14, cursor: "pointer" }}>Go to Settings</button>
-            </a>
+            </Link>
           </>
         )}
       </s-section>
